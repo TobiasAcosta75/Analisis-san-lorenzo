@@ -1,0 +1,684 @@
+#!/usr/bin/env python3
+"""
+fad/torneos.py
+==============
+Que paginas de Wikipedia componen el dataset.
+
+Es una tabla explicita y no un descubrimiento automatico. Se puede adivinar el
+titulo de una temporada por patron ("Anexo:Torneo Apertura {anio} (Argentina)"),
+pero el futbol argentino le cambio el nombre y el formato al campeonato casi
+todos los anios: Inicial/Final, Transicion, Superliga, Copa de la Liga, Apertura
+/Clausura otra vez. No hay patron que sobreviva a eso, y una lista escrita a mano
+falla al agregar una temporada — no en silencio, que es lo que importa.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class Torneo:
+    pagina: str          # titulo exacto en es.wikipedia.org
+    torneo: str          # va a la columna `tournament`
+    temporada: int       # va a la columna `season`
+    formato: str = "liga"    # "liga" (zonas + llaves) o "copa" (tabla por ronda)
+    neutral: bool = False    # si TODA la competencia se juega en cancha neutral
+    anio_fin: int | None = None   # si la temporada cruza el calendario (2016-17)
+    mes_inicio: int = 8           # mes en que arranca; solo importa si cruza
+    # EL ANIO EN QUE ARRANCA, cuando no es el de la etiqueta. `None` = es el mismo,
+    # que es lo que pasa en todos los torneos menos uno.
+    #
+    # `temporada` hacia dos trabajos: rotular la fila (`season`) y decir con que
+    # anio se fechan los partidos que la pagina escribe sin anio. Casi siempre
+    # coinciden. No en una copa que se rotula por el anio en que se DEFINIO: la
+    # Copa Argentina 2011-12 es `season=2012` --ver el comentario de `COPAS`-- y
+    # sus primeras rondas se jugaron en noviembre y diciembre de 2011. Con un solo
+    # campo habia que elegir entre fechar bien y rotular como el resto, y se
+    # fechaba mal: 26 partidos de 2011 figuraban a fines de 2012, despues de la
+    # final de agosto.
+    #
+    # Asi que la etiqueta sigue siendo `temporada` y esto, cuando esta, es el anio
+    # que se le pasa al que fecha. Va con `anio_fin` y `mes_inicio`, como en
+    # cualquier torneo que cruza el calendario.
+    anio_inicio: int | None = None
+    # Un torneo TERMINADO no se vuelve a bajar: sus filas se toman del CSV que ya
+    # esta commiteado. No es solo ahorrar pedidos -- que son 90 de 96 --, es sacar
+    # riesgo: si manana alguien reestructura la pagina del Clausura 2007, no hay
+    # ninguna razon para que eso toque un dato de hace diecinueve anios. El
+    # partido ya se jugo; el dato es duro. `build.py --rehacer` los vuelve a
+    # parsear cuando de verdad haga falta.
+    cerrado: bool = True
+
+    @property
+    def primer_anio(self) -> int:
+        """El anio con que se fechan los partidos anteriores al corte."""
+        return self.anio_inicio or self.temporada
+    # LA SECCION DE NIVEL 2 EN QUE VIVE ESTE TORNEO, cuando la pagina es la de una
+    # TEMPORADA ENTERA y no la de un torneo. Vacio = la pagina es toda suya.
+    #
+    # Hace falta desde que `wikitexto` sigue las redirecciones. La temporada
+    # 1990-91 publica el Apertura y el Clausura en la misma pagina, con una tabla
+    # cada uno, una tabla combinada de 38 partidos y el cuadro de la Liguilla
+    # Pre-Libertadores. Sin acotar, los chequeos de tabla se quedan con la
+    # combinada --gana por PJ-- y despues se callan porque 38 no es 19; y el cuadro
+    # de la Liguilla sale como si fuera la fase final de cada torneo.
+    #
+    # Acota SOLO lo que se le pasa a `fad/posiciones.py`. El resto del pipeline
+    # sigue viendo la pagina entera: los nombres de club del padron, por ejemplo,
+    # viven en la seccion `Equipos`, que es de la temporada y no de un torneo.
+    seccion: str = ""
+    # ------------------------------------------------------------------
+    # De donde sale la FECHA cuando la pagina de Wikipedia no la trae.
+    #
+    # Son dos fuentes y ninguna cubre todo, que es la razon de que sean dos:
+    # worldfootball no tiene Primera C ni el Argentino A, y RSSSF tiene el
+    # Argentino A viejo y la Primera B y C de esos anios. Lo que ninguna de las dos
+    # puede fechar se copia a mano de una fuente citada, partido por partido, y eso
+    # no se marca aca: vive en `fad/citadas.py`, indexado por pagina.
+    # Todo lo demas -- equipos, marcador, jornada -- sigue saliendo de Wikipedia,
+    # y `source` dice fila por fila quien puso la fecha.
+    #
+    # HUBO UNA TERCERA, el feed de ESPN, y se saco entera: sus condiciones de uso
+    # no autorizan a extraer contenido para armar una base de datos. Ponia 21
+    # filas, y las 21 se consiguieron de otro lado: cuatro dias estaban en la
+    # pagina y no se leian, tres salieron de RSSSF, y los catorce partidos del
+    # Reducido de la Primera C 2011-12 estan citados en `fad/citadas.py`.
+    # ------------------------------------------------------------------
+    # Ids de competencia y temporada en worldfootball. Salen del selector del
+    # propio sitio, no de adivinar.
+    wf: tuple[str, str] | None = None
+    # Archivo de RSSSF (`arg3-int06` -> rsssf.org/tablesa/arg3-int06.html). Ver
+    # `fad/rsssf.py`: hace falta ademas un mapa de nombres POR ZONA, porque RSSSF
+    # los escribe cortos y resolverlos por el padron da el club equivocado, que
+    # es peor que un error.
+    rsssf: str | None = None
+
+    # La pagina no tiene grilla y los partidos salen de `rsssf`. Es un flag
+    # EXPLICITO y no "si el parser devolvio vacio", y la diferencia importa:
+    # una grilla que dejo de parsearse por un bug se ve exactamente igual que
+    # una que no existe, y con la regla automatica la importacion taparia la
+    # regresion en silencio. Asi, importar es una decision escrita.
+    sin_grilla: bool = False
+    # La pagina TIENE grilla de la fase de grupos pero su fase final existe solo
+    # como cuadro, y un cuadro no dice quien fue local. Con esto, las llaves se
+    # traen de `rsssf` y el resto sigue saliendo de Wikipedia.
+    #
+    # Va escrito y aparte de `sin_grilla` por la misma razon que aquel: que se
+    # dispare solo, "si el cuadro no cierra", convertiria una regresion del parser
+    # en una importacion silenciosa.
+    rsssf_llaves: bool = False
+    # El archivo de RSSSF esta en el formato COMPACTO -- las dos patas en un
+    # renglon y la fecha como RANGO --, asi que sus filas entran sin fecha y
+    # terminan en `data/sin-fecha`. Va aparte de `rsssf_llaves` porque la
+    # diferencia no es de formato sino de lo que se puede afirmar.
+    rsssf_compacto: bool = False
+
+    @property
+    def url(self) -> str:
+        return "https://es.wikipedia.org/wiki/" + self.pagina.replace(" ", "_")
+
+
+# `formato` va escrito y no se detecta solo. Una pagina de copa y una de liga se
+# parecen lo bastante como para que una deteccion automatica devuelva cero
+# partidos en vez de fallar, y cero partidos se parece mucho a "todavia no
+# empezo el torneo".
+PRIMERA = [
+    Torneo("Anexo:Torneo Apertura 2026 (Argentina)", "Primera Division - Apertura", 2026),
+    Torneo("Anexo:Torneo Clausura 2026 (Argentina)", "Primera Division - Clausura", 2026, cerrado=False),
+]
+
+# El historico. Diez temporadas y siete nombres distintos para el mismo
+# campeonato -- por eso el catalogo va a mano: no hay patron de titulo que
+# sobreviva a Campeonato / Superliga / Copa de la Liga / Apertura-Clausura.
+#
+# `anio_fin` marca las que cruzan el calendario. Ojo con `mes_inicio`: la 2019-20
+# arranco el 26 de JULIO, y con el corte habitual de agosto su Fecha 1 entera
+# quedaba fechada en julio de 2020, al final de la temporada.
+#
+# En 2020-2024 conviven dos torneos por anio (la Copa de la Liga y el campeonato
+# largo) y los dos son de Primera: dejar uno afuera deja medio calendario sin
+# cubrir, que para estimar forma reciente es peor que no tener el anio.
+HISTORICO = [
+    Torneo("Campeonato de Primera División 2016 (Argentina)",
+           "Primera Division", 2016),
+    Torneo("Campeonato de Primera División 2016-17 (Argentina)",
+           "Primera Division", 2016, anio_fin=2017),
+    Torneo("Campeonato de Primera División 2017-18 (Argentina)",
+           "Primera Division", 2017, anio_fin=2018),
+    Torneo("Campeonato de Primera División 2018-19 (Argentina)",
+           "Primera Division", 2018, anio_fin=2019),
+    Torneo("Campeonato de Primera División 2019-20 (Argentina)",
+           "Primera Division", 2019, anio_fin=2020, mes_inicio=7),
+
+    # LA COPA DE LA LIGA 2020 TERMINO EN 2021, y hasta el 10/10/2026 este renglon no
+    # lo decia. Arranco el 30 de octubre de 2020 y sus fechas 4 y 5 de la segunda
+    # fase se jugaron entre el 2 y el 14 de enero de 2021; la pagina las escribe "2
+    # de enero" a secas, y sin `anio_fin` el anio que se les ponia era el de la
+    # temporada. Eran 24 partidos fechados en enero de 2020, diez meses ANTES de que
+    # el torneo empezara -- entre ellos un `Boca 2-2 River`.
+    #
+    # Las dos finales y el partido del 31 de marzo ya estaban bien: a esos la pagina
+    # les escribe el anio. Por eso nadie lo vio mirando el final del torneo.
+    #
+    # `mes_inicio` queda en el 8 por defecto, y NO hay que copiarle el 11 de los
+    # torneos de transicion de ese mismo anio: con 11, los seis partidos de octubre
+    # se van a octubre de 2021. Medido: cualquier valor de 2 a 10 da lo mismo.
+    Torneo("Copa de la Liga Profesional 2020", "Copa de la Liga", 2020, anio_fin=2021),
+    Torneo("Copa de la Liga Profesional 2021", "Copa de la Liga", 2021),
+    Torneo("Campeonato de Primera División 2021 (Argentina)",
+           "Primera Division", 2021),
+    Torneo("Copa de la Liga Profesional 2022", "Copa de la Liga", 2022),
+    Torneo("Campeonato de Primera División 2022 (Argentina)",
+           "Primera Division", 2022),
+    Torneo("Copa de la Liga Profesional 2023", "Copa de la Liga", 2023),
+    Torneo("Campeonato de Primera División 2023 (Argentina)",
+           "Primera Division", 2023),
+    Torneo("Copa de la Liga Profesional 2024", "Copa de la Liga", 2024),
+    Torneo("Campeonato de Primera División 2024 (Argentina)",
+           "Primera Division", 2024),
+
+    Torneo("Anexo:Torneo Apertura 2025 (Argentina)",
+           "Primera Division - Apertura", 2025),
+    Torneo("Anexo:Torneo Clausura 2025 (Argentina)",
+           "Primera Division - Clausura", 2025),
+]
+
+# `neutral=True` no es una suposicion: la Copa Argentina se juega a partido unico
+# en cancha neutral por reglamento, y la propia pagina lo dice ronda por ronda
+# ("se enfrentaron a partido unico en estadio neutral"). Es el unico caso hasta
+# ahora en que el dato se puede afirmar sin mirar donde queda cada estadio.
+# La temporada es el anio en que se JUGARON, que no siempre coincide con el
+# titulo: la "2016-17" se disputo entera en 2017. No hay edicion 2021 -- la
+# 2019-20 se estiro hasta diciembre de 2020 por la pandemia y la siguiente
+# arranco en febrero de 2022.
+COPAS = [
+    # La unica edicion que cruza el anio SIN que la pagina lo escriba. Sus
+    # treintaidosavos se jugaron del 22 de noviembre de 2011 al 29 de febrero de
+    # 2012 y la final fue el 8 de agosto de 2012; con `season=2012` a secas, los 26
+    # partidos de noviembre y diciembre quedaban fechados DESPUES de la final.
+    # RSSSF los publica antes de su primer encabezado con anio, `[Feb 2, 2012]`.
+    # `mes_inicio=9` y no 8: con 8, la final de agosto se iria a 2011.
+    # Ver `Torneo.anio_inicio`.
+    Torneo("Copa Argentina 2011-12", "Copa Argentina", 2012,
+           anio_inicio=2011, anio_fin=2012, mes_inicio=9,
+           formato="copa", neutral=True),
+    Torneo("Copa Argentina 2012-13", "Copa Argentina", 2013,
+           formato="copa", neutral=True),
+    Torneo("Copa Argentina 2013-14", "Copa Argentina", 2014,
+           formato="copa", neutral=True),
+    Torneo("Copa Argentina 2014-15", "Copa Argentina", 2015,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2015-16', "Copa Argentina", 2016,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2016-17', "Copa Argentina", 2017,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2017-18', "Copa Argentina", 2018,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2018-19', "Copa Argentina", 2019,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2019-20', "Copa Argentina", 2020,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2022', "Copa Argentina", 2022,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2023', "Copa Argentina", 2023,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2024', "Copa Argentina", 2024,
+           formato="copa", neutral=True),
+    Torneo('Copa Argentina 2025', "Copa Argentina", 2025,
+           formato="copa", neutral=True),
+    Torneo("Copa Argentina 2026", "Copa Argentina", 2026,
+           formato="copa", neutral=True, cerrado=False),
+]
+
+# Las divisiones que juegan la Copa Argentina. Sin ellas, la mitad de los cruces
+# de la Copa tiene un lado del que no se sabe nada: un club de Primera Nacional
+# aparece una vez y desaparece.
+#
+# Cada una trae su propia forma de estar armada, y por eso el parser tuvo que
+# aprender que una pagina puede tener VARIAS secciones "Resultados": el ascenso
+# pone `== Zona A ==` y `== Zona B ==` de primer nivel con una adentro de cada
+# una, y Primera B y C meten `== Torneo Apertura ==` y `== Torneo Clausura ==`,
+# o sea dos torneos en la misma pagina, cada uno con su Fecha 1.
+ASCENSO = [
+    Torneo("Campeonato de Primera Nacional 2024", "Primera Nacional", 2024),
+    Torneo("Campeonato de Primera Nacional 2025", "Primera Nacional", 2025),
+    Torneo("Campeonato de Primera Nacional 2026", "Primera Nacional", 2026, cerrado=False),
+
+    Torneo("Campeonato de Primera B 2024 (Argentina)", "Primera B", 2024),
+    Torneo("Campeonato de Primera B 2025 (Argentina)", "Primera B", 2025),
+    Torneo("Campeonato de Primera B 2026 (Argentina)", "Primera B", 2026, cerrado=False),
+
+    Torneo("Campeonato de Primera C 2024 (Argentina)", "Primera C", 2024),
+    Torneo("Campeonato de Primera C 2025 (Argentina)", "Primera C", 2025),
+    Torneo("Campeonato de Primera C 2026 (Argentina)", "Primera C", 2026, cerrado=False),
+
+    Torneo("Torneo Federal A 2024", "Torneo Federal A", 2024),
+    Torneo("Torneo Federal A 2025", "Torneo Federal A", 2025),
+    Torneo("Torneo Federal A 2026", "Torneo Federal A", 2026, cerrado=False),
+]
+
+# El ascenso 2011-2015. Las temporadas anteriores a 2011 quedan pendientes: la
+# mitad de esas paginas no trae fechas y la otra mitad usa otro formato.
+ASCENSO_VIEJO = [
+    # Las cuatro mas viejas son las UNICAS del catalogo que necesitan una segunda
+    # fuente. Sus paginas publican los resultados en tablas de tres columnas
+    # -- Local | Resultado | Visitante -- sin ninguna columna de fecha, asi que
+    # el parser saca los 1520 partidos completos y ninguno con dia. Como el
+    # esquema promete una fecha en cada fila, sin eso los 1520 se descartan
+    # enteros: la diferencia no es "peor calidad", es que el torneo no existe.
+    #
+    # `wf` son los ids de worldfootball, de donde sale ese unico campo. El resto
+    # -- equipos, marcador, jornada -- sigue siendo de Wikipedia, y la columna
+    # `source` de esas filas nombra a las dos.
+    # `rsssf_llaves` SIN `rsssf`: de ese archivo se lee solo la seccion de la
+    # promocion, acotada en `rsssf.SECCION`. La fase regular ya la fecha
+    # worldfootball entera y no hay nada que ir a buscarle.
+    Torneo("Campeonato de Primera B Nacional 2007-08", "Primera Nacional", 2007,
+           anio_fin=2008, wf=("co1787", "se19981"), rsssf_llaves=True),
+    Torneo("Campeonato de Primera B Nacional 2008-09", "Primera Nacional", 2008,
+           anio_fin=2009, wf=("co1787", "se19980")),
+    Torneo("Campeonato de Primera B Nacional 2009-10", "Primera Nacional", 2009,
+           anio_fin=2010, wf=("co1787", "se19979")),
+    Torneo("Campeonato de Primera B Nacional 2010-11", "Primera Nacional", 2010,
+           anio_fin=2011, wf=("co1787", "se6101")),
+
+    Torneo("Campeonato de Primera B Nacional 2011-12", "Primera Nacional", 2011, anio_fin=2012),
+    Torneo("Campeonato de Primera B Nacional 2012-13", "Primera Nacional", 2012, anio_fin=2013),
+    Torneo("Campeonato de Primera B Nacional 2013-14", "Primera Nacional", 2013, anio_fin=2014),
+    Torneo("Campeonato de Primera B Nacional 2014", "Primera Nacional", 2014),
+    Torneo("Campeonato de Primera B Nacional 2015", "Primera Nacional", 2015),
+
+    Torneo("Campeonato de Primera B 2011-12 (Argentina)", "Primera B", 2011, anio_fin=2012),
+    Torneo("Campeonato de Primera B 2012-13 (Argentina)", "Primera B", 2012, anio_fin=2013),
+    Torneo("Campeonato de Primera B 2013-14 (Argentina)", "Primera B", 2013, anio_fin=2014),
+    Torneo("Campeonato de Primera B 2014 (Argentina)", "Primera B", 2014),
+    Torneo("Campeonato de Primera B 2015 (Argentina)", "Primera B", 2015),
+
+    # Su Reducido -- cuartos, semis y final -- esta en Wikipedia SOLO como cuadro,
+    # y es la unica de las cinco que RSSSF no cubre: su archivo de 2012 llega
+    # hasta la Primera B Metropolitana y no baja a la C. Sus catorce partidos
+    # estan citados a mano en `citadas.LLAVES`, que dice de donde sale cada cosa.
+    Torneo("Campeonato de Primera C 2011-12 (Argentina)", "Primera C", 2011,
+           anio_fin=2012),
+    Torneo("Campeonato de Primera C 2012-13 (Argentina)", "Primera C", 2012, anio_fin=2013),
+    Torneo("Campeonato de Primera C 2013-14 (Argentina)", "Primera C", 2013, anio_fin=2014),
+    Torneo("Campeonato de Primera C 2014 (Argentina)", "Primera C", 2014),
+    Torneo("Campeonato de Primera C 2015 (Argentina)", "Primera C", 2015),
+
+    # El Torneo Federal A se llamo "Torneo Argentino A" hasta 2014. Va con su
+    # nombre historico: es la misma categoria pero no el mismo torneo.
+    # Su pagina publica la Revalida y las fases tercera y cuarta, pero de las
+    # SEMIS y la FINAL solo el cuadro. De ahi salen los 6 partidos que faltan;
+    # los otros 34 que RSSSF tambien trae ya estan y no se duplican.
+    Torneo("Torneo Argentino A 2011-12", "Torneo Argentino A", 2011, anio_fin=2012,
+           rsssf="arg2012", rsssf_llaves=True),
+    # Con grilla propia en Wikipedia; RSSSF entra solo a FECHAR los 28 partidos
+    # que la pagina publica sin fecha y que por eso quedaban afuera.
+    # De su Revalida la pagina publica el cuadro y no la grilla, asi que dos
+    # llaves --Sportivo Belgrano-San Martin (T) y Santamarina-Deportivo Maipu--
+    # no tenian partido. RSSSF las tiene, y en el formato expandido.
+    Torneo("Torneo Argentino A 2012-13", "Torneo Argentino A", 2012, anio_fin=2013,
+           rsssf="arg3-int2013", rsssf_llaves=True),
+    Torneo("Torneo Argentino A 2013-14", "Torneo Argentino A", 2013, anio_fin=2014),
+    # La primera edicion con el nombre nuevo: el torneo de transicion del segundo
+    # semestre de 2014, del 23/08 al 07/12, con siete ascensos y ningun descenso.
+    # Cinco zonas de ocho a dos ruedas (280 partidos), dos desempates por el primer
+    # puesto y tres fases de eliminacion a doble partido (28): 310, que es lo que
+    # dice su ficha. Entran 309; el que falta es el `Deportivo Roca - Cipolletti`
+    # que perdieron los dos, ver `correcciones.DIVIDIDOS`.
+    # La pagina fecha sus 309 filas y no necesita segunda fuente. Se la cruzo igual,
+    # una vez, contra RSSSF --`arg2015`, que pese al nombre es el archivo del anio
+    # 2014--: los 309 emparejan por zona, fecha y localia, y 308 coinciden en dia y
+    # marcador. El que no es la vuelta de la final por el septimo ascenso, `Sportivo
+    # Patria - Atlético Paraná`: la pagina publica el 1-3 que habia en la cancha
+    # cuando se suspendio, a los 75 minutos, y el Tribunal lo registro 0-3. Entra
+    # 0-3 y `suspendido`, arbitrado por `correcciones.MARCADORES`.
+    # De los cuatro avisos que da la pagina, uno es que el cuadro de eliminacion no
+    # se pudo revisar: rotula solo la pata --`Partidos de ida` y `Partidos de
+    # vuelta`-- en sus tres fases, y `validar.cadena_de_llaves` no las puede separar.
+    # Esa cadena se reviso a mano.
+    Torneo("Torneo Federal A 2014", "Torneo Federal A", 2014),
+
+    # El Federal A 2015: 40 clubes y 652 partidos, todos con fecha en la pagina, del
+    # 20 de marzo al 10 de diciembre -- un solo anio, sin `anio_fin`. Son 360 de la
+    # primera fase (cuatro zonas de 10, ida y vuelta), 91 del Tetradecagonal, 156 de
+    # la Revalida (dos zonas de 13, una rueda), el desempate por el descenso y 44 de
+    # la eliminatoria (22 llaves a dos partidos, de la tercera a la septima fase).
+    #
+    # Entro cruzado contra RSSSF (`arg2015a`, que NO es `arg2015`: ese es el 2014)
+    # partido por partido: los 652 coinciden en el marcador y 651 en el dia. El que
+    # no, Ferro (GP)-CAI de la Fecha 2, se suspendio a los 18 minutos el 29 de marzo
+    # y se completo el 17 de junio: la pagina da el dia en que empezo, que es la
+    # convencion del repo, y RSSSF el dia en que termino.
+    # La ficha de la pagina dice 651 partidos: es el fixture programado, 607 de las
+    # tres etapas de grupos y 44 de la eliminatoria, sin el desempate por el
+    # descenso del 30 de octubre. La grilla y RSSSF tienen los 652.
+    #
+    # Las zonas no chocan: la primera fase usa `Zona 1` a `Zona 4` y la Revalida
+    # `Zona A` y `Zona B`. La seccion del descenso repite `Zona A` y `Zona B` como
+    # titulos, pero de ahi solo sale el desempate, que entra sin zona.
+    Torneo("Torneo Federal A 2015", "Torneo Federal A", 2015),
+]
+
+# El historico del ascenso: las mismas cuatro divisiones hacia atras.
+ASCENSO_HISTORICO = [
+    Torneo('Campeonato de Primera B Nacional 2016', 'Primera Nacional', 2016),
+    Torneo('Campeonato de Primera B Nacional 2016-17', 'Primera Nacional', 2016, anio_fin=2017),
+    Torneo('Campeonato de Primera B Nacional 2017-18', 'Primera Nacional', 2017, anio_fin=2018),
+    Torneo('Campeonato de Primera B Nacional 2018-19', 'Primera Nacional', 2018, anio_fin=2019),
+    Torneo('Campeonato de Primera Nacional 2019-20', 'Primera Nacional', 2019, anio_fin=2020),
+
+    Torneo('Campeonato de Primera Nacional 2021', 'Primera Nacional', 2021),
+    # Estuvo FUERA por UN partido que dice 'San Martin' a secas, sin enlace,
+    # donde juegan el (SJ) y el (T). Se resolvio sin fuentes externas: en esa
+    # fecha el (SJ) ya juega y el (T) no. Ver `fad/correcciones.py`.
+    Torneo('Campeonato de Primera Nacional 2022', 'Primera Nacional', 2022),
+    Torneo('Campeonato de Primera Nacional 2023', 'Primera Nacional', 2023),
+
+    Torneo('Campeonato de Primera B 2016 (Argentina)', 'Primera B', 2016),
+    Torneo('Campeonato de Primera B 2016-17 (Argentina)', 'Primera B', 2016, anio_fin=2017),
+    # Estuvo FUERA con el cartel "lista dos veces las fechas de la primera rueda",
+    # que era falso. Lo que la frenaba era UN partido: el desempate que definio el
+    # campeonato colgaba de un encabezado `!colspan=12|Desempate`, el parser lo
+    # tomaba por zona, y `todos_tienen_zona` saltaba por la mezcla de 306 partidos
+    # sin zona y uno con. Ver `parser._ES_RONDA`.
+    Torneo('Campeonato de Primera B 2017-18 (Argentina)', 'Primera B', 2017, anio_fin=2018),
+    Torneo('Campeonato de Primera B 2018-19 (Argentina)', 'Primera B', 2018, anio_fin=2019),
+    Torneo('Campeonato de Primera B 2019-20 (Argentina)', 'Primera B', 2019, anio_fin=2020),
+
+    # Estuvo FUERA un tiempo, con el cartel "una plantilla {{Partido}} sin cerrar
+    # bien mezcla el resultado de dos partidos". La culpa no era de la pagina: sus
+    # doce plantillas cierran perfecto. Era el parser, que buscaba el cierre con un
+    # regex y se comia las del medio. Ver `_plantillas_partido`.
+    Torneo('Campeonato de Primera B 2021 (Argentina)', 'Primera B', 2021),
+    Torneo('Campeonato de Primera B 2022 (Argentina)', 'Primera B', 2022),
+    Torneo('Campeonato de Primera B 2023 (Argentina)', 'Primera B', 2023),
+
+    # Sin fecha en la fuente: sus tablas son de tres columnas
+    # Local | Resultado | Visitante. Los partidos estan completos y verificados
+    # -- los goles coinciden con la ficha de cada pagina --, asi que se guardan en
+    # `data/sin-fecha/` a la espera de una fuente de fechas. worldfootball no
+    # sirve: su selector no lista Primera C para Argentina.
+    # Su Reducido -- cuartos, semis y final -- esta en Wikipedia SOLO como cuadro.
+    # RSSSF lo tiene en `arg4-09`, que es OTRA division y otro archivo: el cuarto
+    # nivel metropolitano. Cuidado con `arg4-int09`, que es el cuarto nivel del
+    # INTERIOR (el Argentino B) y es el error facil.
+    Torneo('Campeonato de Primera C 2008-09 (Argentina)', 'Primera C', 2008,
+           anio_fin=2009, rsssf='arg4-09', rsssf_llaves=True),
+    Torneo('Campeonato de Primera C 2009-10 (Argentina)', 'Primera C', 2009,
+           anio_fin=2010, rsssf='arg4-2010'),
+    # Arranco en JULIO de 2010 -- la fecha 1 fue el 24/07 en la B y el 31/07 en
+    # la C --, asi que sin `mes_inicio=7` esos partidos se fechan un anio tarde.
+    Torneo('Campeonato de Primera C 2010-11 (Argentina)', 'Primera C', 2010,
+           anio_fin=2011, mes_inicio=7, rsssf='arg2011'),
+    # Este ESTUVO en `sin-fecha/` por un diagnostico equivocado, y conviene dejar
+    # escrito cual. El comentario que habia aca decia: "sus tablas SI tienen
+    # columna de fecha, pero la pagina la deja vacia en casi todas las filas...
+    # quedan 65 de 438 con fecha, y NO ES EL PARSER: la fuente no la trae".
+    #
+    # Era el parser. `_partir` descartaba las celdas vacias, asi que en las
+    # jornadas donde la pagina deja el ESTADIO en blanco -- de la Fecha 18 en
+    # adelante -- las columnas se corrian un lugar y la fecha aterrizaba en la
+    # cancha. El partido salia sin fecha y con `venue = "2 de febrero"`, que es
+    # peor que salir sin nada: no era un hueco, era un dato falso.
+    #
+    # Arreglado el corrimiento, la pagina fecha sus 438 partidos, los 438. La
+    # leccion es la de siempre en este repo: antes de culpar a la fuente,
+    # medirlo. "La fuente no lo trae" es comodo y hay que probarlo.
+    # La fase final la publica sin dia, y RSSSF la trae fechada dentro de
+    # `arg2011`. Ver `rsssf.SECCION`, que dice desde donde.
+    Torneo('Torneo Argentino A 2010-11', 'Torneo Argentino A', 2010,
+           anio_fin=2011, rsssf_llaves=True),
+    # Igual que la de arriba: tiene columna de fecha y la deja vacia en 462 de
+    # sus 474 filas. La mitad de las jornadas ademas escribe los clubes con el
+    # nombre cortado ("Sp. Italiano", "T. Suarez"), que estan como alias.
+    # Arranco en JULIO de 2010 -- la fecha 1 fue el 24/07 en la B y el 31/07 en
+    # la C --, asi que sin `mes_inicio=7` esos partidos se fechan un anio tarde.
+    Torneo('Campeonato de Primera B 2010-11 (Argentina)', 'Primera B', 2010,
+           anio_fin=2011, mes_inicio=7, rsssf='arg2011'),
+    # Y esta: 12 fechadas de 279. Trajo diez clubes del interior que el padron
+    # no tenia -- Lujan de Cuyo, Nunorco, La Plata FC, Atletico Candelaria... --
+    # todos sacados del articulo que enlaza su propia tabla de participantes.
+    # Su fase final -- 1/8, cuartos, semis y final del Apertura y del Clausura --
+    # esta en Wikipedia SOLO como cuadro, y un cuadro no dice la localia: medido,
+    # la convencion "arriba es local en la ida" acierta 55.6%. RSSSF si la dice, y
+    # ademas con fecha de dia. De ahi salen 58 partidos que faltaban.
+    Torneo('Torneo Argentino A 2005-06', 'Torneo Argentino A', 2005,
+           anio_fin=2006, rsssf='arg3-int06', rsssf_llaves=True),
+    # El primer torneo del repo cuyos partidos NO salen de Wikipedia. Su articulo
+    # publica los participantes, la tabla final de cada zona y la fase final, y
+    # ningun resultado fecha por fecha -- se comprobo catalogandola sin el flag,
+    # que dio cero partidos --. RSSSF si los tiene, y `source` lo dice fila por
+    # fila. La tabla de posiciones de Wikipedia sigue estando, asi que estas filas
+    # pasan por el mismo cruce que todas las demas.
+    # La mas flaca del corpus, y a proposito: de su fase de grupos Wikipedia
+    # publica los resultados de UNA sola zona -- la Norte del Apertura -- y de las
+    # otras siete nada mas que las tablas. RSSSF tampoco los tiene: su archivo trae
+    # las tablas finales y las llaves, no la grilla. Asi que lo que entra son las
+    # llaves de las dos Revalidas, las dos fases finales, la permanencia y las
+    # promociones, mas esa unica zona. No se inventa el resto; queda anotado.
+    Torneo('Torneo Argentino A 2004-05', 'Torneo Argentino A', 2004, anio_fin=2005,
+           rsssf='arg3-int05', rsssf_compacto=True),
+    Torneo('Torneo Argentino A 2006-07', 'Torneo Argentino A', 2006,
+           anio_fin=2007, rsssf='arg3-int07', sin_grilla=True),
+    # La tercera sin grilla, y la que enseño a no dar por buena la analogia con la
+    # anterior: sus `Group A` y `Group B` SI son dos zonas de 8 -- la Zona 1 y la
+    # Zona 2 --, aunque cada bloque nombre 16 clubes. Los otros 8 son los rivales
+    # del interzonal, que RSSSF imprime bajo los dos grupos. Lo zanja la cuenta de
+    # partidos, no la de nombres: 112 + 112 + 32 + 144 = 400.
+    Torneo('Torneo Argentino A 2007-08', 'Torneo Argentino A', 2007,
+           anio_fin=2008, rsssf='arg3-int08', sin_grilla=True),
+    # La segunda sin grilla, y la que enseño que la correspondencia de zonas no se
+    # da por hecha: RSSSF la parte en `Zone 1`, `Zone 2` y `Zone 3`, pero sus dos
+    # primeras son ETAPAS sobre los mismos 16 clubes y la pagina las reparte en dos
+    # zonas de 8. Ver el mapa en `fad/rsssf.py`.
+    Torneo('Torneo Argentino A 2008-09', 'Torneo Argentino A', 2008,
+           anio_fin=2009, rsssf='arg3-int09', sin_grilla=True),
+    # La cuarta sin grilla, y la primera con DOS torneos adentro: Apertura y
+    # Clausura reparten los clubes distinto, asi que el mapa se forzo por (torneo,
+    # zona) y despues se unio. Ver `fad/rsssf.py`.
+    Torneo('Torneo Argentino A 2009-10', 'Torneo Argentino A', 2009,
+           anio_fin=2010, rsssf='arg3-int2010', sin_grilla=True),
+
+    Torneo('Campeonato de Primera C 2016 (Argentina)', 'Primera C', 2016),
+    Torneo('Campeonato de Primera C 2016-17 (Argentina)', 'Primera C', 2016, anio_fin=2017),
+    Torneo('Campeonato de Primera C 2017-18 (Argentina)', 'Primera C', 2017, anio_fin=2018),
+    Torneo('Campeonato de Primera C 2018-19 (Argentina)', 'Primera C', 2018, anio_fin=2019),
+    # `mes_inicio=7`: la fecha 1 se jugo el 27, 28 y 30 de julio de 2019. Con el
+    # corte en agosto esos 8 partidos quedaban en julio de 2020, cuando no habia
+    # futbol en ninguna cancha. Es el mismo arreglo que la Primera Division de esa
+    # temporada ya tenia, y el caso exacto que describe el docstring de
+    # `validar.anios_bien_asignados` -- que aca no lo vio porque juntaba el Apertura
+    # y el Clausura por numero de fecha. Desde el 10/10/2026 los mira por separado.
+    Torneo('Campeonato de Primera C 2019-20 (Argentina)', 'Primera C', 2019, anio_fin=2020,
+           mes_inicio=7),
+
+    Torneo('Campeonato de Primera C 2021 (Argentina)', 'Primera C', 2021),
+    Torneo('Campeonato de Primera C 2022 (Argentina)', 'Primera C', 2022),
+    Torneo('Campeonato de Primera C 2023 (Argentina)', 'Primera C', 2023),
+
+    Torneo('Torneo Federal A 2016', 'Torneo Federal A', 2016),
+    Torneo('Torneo Federal A 2016-17', 'Torneo Federal A', 2016, anio_fin=2017),
+    Torneo('Torneo Federal A 2017-18', 'Torneo Federal A', 2017, anio_fin=2018),
+    Torneo('Torneo Federal A 2018-19', 'Torneo Federal A', 2018, anio_fin=2019),
+    Torneo('Torneo Federal A 2019-20', 'Torneo Federal A', 2019, anio_fin=2020),
+
+    Torneo('Torneo Federal A 2021', 'Torneo Federal A', 2021),
+    Torneo('Torneo Federal A 2022', 'Torneo Federal A', 2022),
+    Torneo('Torneo Federal A 2023', 'Torneo Federal A', 2023),
+
+    # Los torneos de la pandemia: arrancaron en noviembre/diciembre de 2020 y
+    # terminaron en 2021. Sin `anio_fin`, enero de 2021 quedaba once meses
+    # antes del arranque -- lo agarro `validar.anios_bien_asignados`.
+    Torneo('Campeonato Transición de Primera Nacional 2020', 'Primera Nacional', 2020, anio_fin=2021, mes_inicio=11),
+    Torneo('Campeonato Transición de Primera B 2020 (Argentina)', 'Primera B', 2020, anio_fin=2021, mes_inicio=11),
+    Torneo('Campeonato Transición de Primera C 2020 (Argentina)', 'Primera C', 2020, anio_fin=2021, mes_inicio=11),
+    Torneo('Torneo Transición Federal A 2020', 'Torneo Federal A', 2020, anio_fin=2021, mes_inicio=11),
+]
+
+# La era Apertura/Clausura, 2004-2015. El parser no necesito un solo cambio: el
+# formato de tabla es el mismo que el de hoy. Lo unico que crecio fue el padron.
+VIEJO = [
+    # 1997-2003, la mitad de la era vieja que SI publica fechas. Las paginas
+    # estaban cacheadas desde hace rato y el parser ya las leia: 190 partidos por
+    # temporada, que es veinte clubes todos contra todos una vez.
+    #
+    # La linea esta en 1997 y es nitida: desde el Apertura de ese anio las tablas
+    # traen la fecha de cada partido, y antes no. Las de 1991 al Clausura 1997
+    # quedan afuera a proposito -- 2270 partidos sin una sola fecha --, porque una
+    # fila sin fecha no se escribe. Necesitan segunda fuente; RSSSF publica
+    # Primera de esos anios. El Clausura 1997 esta de ese lado: de sus 190
+    # partidos, 10 traen fecha.
+    # La capa 1991-1996, que Wikipedia publica SIN UNA SOLA FECHA. RSSSF publica
+    # Primera de estos anios con sus rondas y sus dias, y el archivo del anio trae
+    # las dos ruedas: el recorte que las separa se declara en `rsssf.SECCION_LIGA`.
+    #
+    # Van LOS DOCE, de `arg92` a `arg97`. La capa entera menos el Clausura 1991, que
+    # Wikipedia deja en un stub de 83 bytes y hay que buscar en otro lado.
+    #
+    # La fuente escribe estos anios de tres maneras y las tres estan cubiertas:
+    # `arg92`-`arg95` separan con tabs, `arg97` alinea por espacios y abrevia los
+    # nombres, y `arg96` alinea por espacios Y separa el guion del marcador
+    # (`2 - 0`) -- el unico que obligo a aflojar `_PARTIDO`.
+    #
+    # EL APERTURA 1993 CRUZA EL ANIO y es el unico: sus rondas 16 a 19 se jugaron en
+    # febrero y marzo del 94, y la fuente lo escribe -- `[Feb 25, 1994 Fri]`. Sin el
+    # `anio_fin` esas cuarenta fechas saldrian un anio corridas.
+    Torneo("Anexo:Torneo Apertura 1992 (Argentina)", "Primera Division - Apertura", 1992,
+           rsssf="arg93"),
+    Torneo("Anexo:Torneo Apertura 1991 (Argentina)", "Primera Division - Apertura", 1991,
+           rsssf="arg92"),
+    Torneo("Anexo:Torneo Clausura 1992 (Argentina)", "Primera Division - Clausura", 1992,
+           rsssf="arg92"),
+    Torneo("Anexo:Torneo Clausura 1993 (Argentina)", "Primera Division - Clausura", 1993,
+           rsssf="arg93"),
+    Torneo("Anexo:Torneo Apertura 1993 (Argentina)", "Primera Division - Apertura", 1993, anio_fin=1994,
+           rsssf="arg94"),
+    Torneo("Anexo:Torneo Clausura 1994 (Argentina)", "Primera Division - Clausura", 1994,
+           rsssf="arg94"),
+    Torneo("Anexo:Torneo Apertura 1994 (Argentina)", "Primera Division - Apertura", 1994,
+           rsssf="arg95"),
+    Torneo("Anexo:Torneo Clausura 1995 (Argentina)", "Primera Division - Clausura", 1995,
+           rsssf="arg95"),
+    Torneo("Anexo:Torneo Apertura 1996 (Argentina)", "Primera Division - Apertura", 1996,
+           rsssf="arg97"),
+    Torneo("Anexo:Torneo Clausura 1997 (Argentina)", "Primera Division - Clausura", 1997,
+           rsssf="arg97"),
+
+    # LA TRECE, y la unica de la capa que entra SIN GRILLA: su pagina de Wikipedia
+    # es una redireccion a la seccion de la temporada, que publica la tabla final y
+    # no los partidos. Los 190 vienen de RSSSF y la tabla de Wikipedia los verifica
+    # en 19 de 20 clubes -- ver el comentario del mapa en `fad/rsssf.py`.
+    Torneo("Anexo:Torneo Clausura 1991 (Argentina)", "Primera Division - Clausura", 1991,
+           rsssf="arg91", sin_grilla=True, seccion="Torneo Clausura"),
+    # LA OTRA MITAD DE `arg91`, y el primer torneo de la capa 1985-1990. El archivo
+    # trae los dos juegos de 19 rondas de la temporada 1990-91, y la pagina de
+    # Wikipedia es la MISMA: no existe `Anexo:Torneo Apertura 1990 (Argentina)` ni
+    # como redireccion, asi que este torneo usa directo el titulo de la temporada.
+    # Por eso tambien lleva `seccion`: sin acotar, los dos tomarian la tabla
+    # combinada de 38 partidos.
+    Torneo("Campeonato de Primera División 1990-91 (Argentina)",
+           "Primera Division - Apertura", 1990,
+           rsssf="arg91", sin_grilla=True, seccion="Torneo Apertura"),
+
+    # LA CAPA 1985-1990: cinco campeonatos unicos, de agosto a junio, que Wikipedia
+    # publica con su tabla y sin sus partidos. Entran como el Clausura 1991 --los
+    # partidos de RSSSF, la tabla de Wikipedia de arbitro-- y cada uno trae lo suyo;
+    # ver los mapas en `fad/rsssf.py`.
+    #
+    # `mes_inicio=7` porque la 1985-86 arranco el 6 de julio. Con el corte por
+    # defecto en agosto, las cuatro primeras fechas quedaban en julio de 1986, al
+    # final de la temporada.
+    #
+    # SIN `seccion`: la pagina tiene una sola tabla del torneo y no hay nada que
+    # acotar. Y la verificacion puede ser CIRCULAR, que conviene decirlo: la unica
+    # referencia de la pagina es el propio `arg86`, asi que los 19 clubes que cierran
+    # exacto pueden estar cerrando contra una tabla copiada de ahi. No hay tercera
+    # fuente a mano; entra respaldada por si misma, y dicho.
+    Torneo("Campeonato de Primera División 1985-86 (Argentina)",
+           "Primera Division", 1985, anio_fin=1986, mes_inicio=7,
+           rsssf="arg86", sin_grilla=True),
+    # La 1986-87 arranco el 13 de julio: `mes_inicio=7`, igual que la anterior y por
+    # lo mismo. Va de julio de 1986 a mayo de 1987, y un partido de la ronda 21 se
+    # termino el 5 de marzo, tres meses despues de empezado; conserva el dia en que
+    # empezo, que es la convencion del repo para el que se juega en dos dias.
+    Torneo("Campeonato de Primera División 1986-87 (Argentina)",
+           "Primera Division", 1986, anio_fin=1987, mes_inicio=7,
+           rsssf="arg87", sin_grilla=True),
+    # La 1987-88 va del 30 de agosto al 5 de junio: el corte de anio por defecto.
+    Torneo("Campeonato de Primera División 1987-88 (Argentina)",
+           "Primera Division", 1987, anio_fin=1988,
+           rsssf="arg88", sin_grilla=True),
+    # La 1988-89, del 11 de septiembre al 28 de mayo.
+    #
+    # `seccion` APUNTA AL APERTURA Y NO A LA TABLA FINAL, y es a proposito. La pagina
+    # publica dos tablas: la del campeonato entero y la de su primera rueda, que fue
+    # ademas un torneo. La del campeonato tiene mal los goles de 14 de los 20 clubes,
+    # y se prueba sin salir de la pagina: restandole la del Apertura, a Argentinos
+    # Juniors le quedan 6 victorias en la segunda rueda con 3 goles a favor. (Los
+    # ganados, empatados y perdidos si coinciden con RSSSF; son las dos columnas de
+    # goles las que estan mal.) La del Apertura cierra contra los partidos.
+    #
+    # Asi que el arbitro de Wikipedia cubre las fechas 1 a 19 --ver
+    # `rsssf.LLAVES_POR_RONDA`, que es lo que le dice contra que 190 partidos
+    # compararse--. Las fechas 20 a 38 no tienen tabla de Wikipedia que sirva; las
+    # sostiene la tabla final de la propia fuente, que esta en un test.
+    Torneo("Campeonato de Primera División 1988-89 (Argentina)",
+           "Primera Division", 1988, anio_fin=1989,
+           rsssf="arg89", sin_grilla=True, seccion="Torneo Apertura 1988-89"),
+    # La 1989-90 va `sin_grilla` AUNQUE LA PAGINA TIENE UNA GRILLA, y hay que
+    # decirlo porque el proximo que la abra la va a ver: publica `== Resultados ==`
+    # con 79 partidos, las fechas 1 a 8, y ahi se termina. Leyendola entran 79 de
+    # 380. Los partidos salen enteros de RSSSF, como en el resto de la capa.
+    Torneo("Campeonato de Primera División 1989-90 (Argentina)",
+           "Primera Division", 1989, anio_fin=1990,
+           rsssf="arg90", sin_grilla=True),
+    Torneo("Anexo:Torneo Apertura 1995 (Argentina)", "Primera Division - Apertura", 1995,
+           rsssf="arg96"),
+    Torneo("Anexo:Torneo Clausura 1996 (Argentina)", "Primera Division - Clausura", 1996,
+           rsssf="arg96"),
+    Torneo("Anexo:Torneo Apertura 1997 (Argentina)", "Primera Division - Apertura", 1997),
+    Torneo("Anexo:Torneo Apertura 1998 (Argentina)", "Primera Division - Apertura", 1998),
+    Torneo("Anexo:Torneo Apertura 1999 (Argentina)", "Primera Division - Apertura", 1999),
+    Torneo("Anexo:Torneo Apertura 2000 (Argentina)", "Primera Division - Apertura", 2000),
+    Torneo("Anexo:Torneo Apertura 2001 (Argentina)", "Primera Division - Apertura", 2001),
+    Torneo("Anexo:Torneo Apertura 2002 (Argentina)", "Primera Division - Apertura", 2002),
+    Torneo("Anexo:Torneo Apertura 2003 (Argentina)", "Primera Division - Apertura", 2003),
+    Torneo("Anexo:Torneo Clausura 1998 (Argentina)", "Primera Division - Clausura", 1998),
+    Torneo("Anexo:Torneo Clausura 1999 (Argentina)", "Primera Division - Clausura", 1999),
+    Torneo("Anexo:Torneo Clausura 2000 (Argentina)", "Primera Division - Clausura", 2000),
+    Torneo("Anexo:Torneo Clausura 2001 (Argentina)", "Primera Division - Clausura", 2001),
+    Torneo("Anexo:Torneo Clausura 2002 (Argentina)", "Primera Division - Clausura", 2002),
+    Torneo("Anexo:Torneo Clausura 2003 (Argentina)", "Primera Division - Clausura", 2003),
+
+    Torneo("Anexo:Torneo Apertura 2004 (Argentina)", "Primera Division - Apertura", 2004),
+    Torneo("Anexo:Torneo Apertura 2005 (Argentina)", "Primera Division - Apertura", 2005),
+    Torneo("Anexo:Torneo Apertura 2006 (Argentina)", "Primera Division - Apertura", 2006),
+    Torneo("Anexo:Torneo Apertura 2007 (Argentina)", "Primera Division - Apertura", 2007),
+    Torneo("Anexo:Torneo Apertura 2008 (Argentina)", "Primera Division - Apertura", 2008),
+    Torneo("Anexo:Torneo Apertura 2009 (Argentina)", "Primera Division - Apertura", 2009),
+    Torneo("Anexo:Torneo Apertura 2010 (Argentina)", "Primera Division - Apertura", 2010),
+    Torneo("Anexo:Torneo Apertura 2011 (Argentina)", "Primera Division - Apertura", 2011),
+    Torneo("Anexo:Torneo Clausura 2004 (Argentina)", "Primera Division - Clausura", 2004),
+    Torneo("Anexo:Torneo Clausura 2005 (Argentina)", "Primera Division - Clausura", 2005),
+    Torneo("Anexo:Torneo Clausura 2006 (Argentina)", "Primera Division - Clausura", 2006),
+    Torneo("Anexo:Torneo Clausura 2007 (Argentina)", "Primera Division - Clausura", 2007),
+    Torneo("Anexo:Torneo Clausura 2008 (Argentina)", "Primera Division - Clausura", 2008),
+    Torneo("Anexo:Torneo Clausura 2009 (Argentina)", "Primera Division - Clausura", 2009),
+    Torneo("Anexo:Torneo Clausura 2010 (Argentina)", "Primera Division - Clausura", 2010),
+    Torneo("Anexo:Torneo Clausura 2011 (Argentina)", "Primera Division - Clausura", 2011),
+    Torneo("Anexo:Torneo Clausura 2012 (Argentina)", "Primera Division - Clausura", 2012),
+
+    # 2012-2014: el campeonato se llamo Inicial y Final. Tres de las cuatro
+    # paginas rotulan sus 19 jornadas sin problema; la del Inicial 2012 no, y
+    # cuelga los 190 partidos de un unico "Fecha 1". Esos entran igual, con
+    # `matchday` vacio -- ver `build._borrar_jornadas_falsas`.
+    Torneo("Anexo:Torneo Inicial 2012 (Argentina)", "Primera Division - Inicial", 2012),
+    Torneo("Anexo:Torneo Final 2013 (Argentina)", "Primera Division - Final", 2013),
+    Torneo("Anexo:Torneo Inicial 2013 (Argentina)", "Primera Division - Inicial", 2013),
+    Torneo("Anexo:Torneo Final 2014 (Argentina)", "Primera Division - Final", 2014),
+    Torneo("Campeonato de Primera División 2014 (Argentina)", "Primera Division", 2014),
+    Torneo("Campeonato de Primera División 2015 (Argentina)", "Primera Division", 2015),
+]
+
+TODOS = ASCENSO_VIEJO + VIEJO + HISTORICO + PRIMERA + ASCENSO + ASCENSO_HISTORICO + COPAS

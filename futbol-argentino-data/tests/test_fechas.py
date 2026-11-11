@@ -1,0 +1,905 @@
+#!/usr/bin/env python3
+"""Tests del modulo que completa fechas desde una segunda fuente.
+
+Este modulo toca datos que ya estan bien, asi que lo que hay que probar no es
+tanto que complete como que **se niegue a completar** cuando no esta seguro. Una
+fecha importada de mas es peor que una fecha faltante: la faltante se ve, la
+importada de mas se parece a un dato.
+
+Ninguno sale a la red: se le pasa el HTML.
+"""
+from __future__ import annotations
+
+import dataclasses
+
+import pytest
+
+from fad import fechas
+from fad.parser import Partido
+
+
+def bloque(id_m, cuando, local, id_local, visita, id_visita, gl, gv, estado="finished",
+           hora="20:30"):
+    """Un partido con la estructura REAL de la fuente, no una parecida.
+
+    La version anterior de este helper inventaba `<div class="resultado">` y no
+    ponia el horario. Los tests pasaban y el parser estaba roto: leia el `20:30`
+    del `match-time` como si fuera el marcador, y devolvia partidos 20-30.
+    Ninguno de los tests podia verlo, porque en la fixture ese div no existia.
+
+    Una fixture escrita de memoria prueba el parser contra lo que uno cree que
+    manda la fuente. Esta esta copiada de un bloque de verdad -- Aldosivi 0:1
+    C.A.I., B Nacional 2010-11 -- con el `match-time` ANTES del `match-result`,
+    que es el orden que causaba el problema.
+    """
+    return (f'<div data-match_id="{id_m}" data-datetime="{cuando}" '
+            f'class="odd {estado} match">'
+            f'<div class="team-name team-name-home">'
+            f'<a href="/teams/{id_local}/x/">{local}</a></div>'
+            f'<div class="team-shortname team-shortname-home">'
+            f'<a href="/teams/{id_local}/x/">{local[:4]}</a></div>'
+            f'<div class="match-time">{hora}</div>'
+            f'<div class="match-result match-result-0">'
+            f'<a href="/match-report/x/">{gl}:{gv}</a></div>'
+            f'<div class="team-name team-name-away">'
+            f'<a href="/teams/{id_visita}/y/">{visita}</a></div></div>')
+
+
+def pagina(*bloques, jornada=1):
+    return (f'<div class="hs-head round-head">Matchday {jornada}</div>'
+            + "".join(bloques))
+
+
+# --------------------------------------------------------------------------
+# la conversion de hora
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize("utc, dia", [
+    ("2007-08-09T22:00:00Z", "2007-08-09"),   # 19:00 en Argentina, mismo dia
+    ("2007-08-10T01:00:00Z", "2007-08-09"),   # 22:00 del dia ANTERIOR
+    ("2007-08-10T14:00:00Z", "2007-08-10"),
+])
+def test_la_hora_viene_en_utc(utc, dia):
+    """`data-datetime` es UTC y Argentina esta tres horas atras.
+
+    Sin convertir, todo partido que empiece despues de las 21:00 local figura al
+    dia siguiente -- o sea la mayoria de los partidos nocturnos. El encabezado
+    visible de la pagina muestra el dia local, asi que ni siquiera coincide con
+    lo que la propia fuente dice.
+    """
+    assert fechas._a_hora_local(utc) == dia
+
+
+def test_una_hora_ilegible_no_inventa_fecha():
+    assert fechas._a_hora_local("cuando sea") == ""
+
+
+# --------------------------------------------------------------------------
+# leer la fuente
+# --------------------------------------------------------------------------
+def test_lee_un_partido():
+    ps = fechas.partidos_de(pagina(
+        bloque("1", "2007-08-09T22:00:00Z", "Instituto de Córdoba", "te17568",
+               "Chacarita Juniors", "te17957", 1, 1)))
+    assert len(ps) == 1
+    p = ps[0]
+    assert (p.fecha, p.jornada) == ("2007-08-09", 1)
+    assert (p.local, p.visita) == ("Instituto de Córdoba", "Chacarita Juniors")
+    assert (p.goles_local, p.goles_visita) == (1, 1)
+    assert (p.id_local, p.id_visita) == ("te17568", "te17957")
+
+
+def test_el_mismo_equipo_enlazado_dos_veces_es_uno_solo():
+    """Cada equipo aparece con su nombre largo y su nombre corto, los dos
+    enlazando al mismo id. Tomando los dos primeros ENLACES sin deduplicar, el
+    local salia como local y como visitante."""
+    ps = fechas.partidos_de(pagina(
+        bloque("1", "2007-08-09T22:00:00Z", "Aldosivi", "te21683",
+               "Almagro", "te18976", 2, 0)))
+    assert (ps[0].local, ps[0].visita) == ("Aldosivi", "Almagro")
+
+
+def test_un_partido_que_no_se_jugo_no_entra():
+    """Suspendido, aplazado o por jugarse: la clase lo dice."""
+    assert fechas.partidos_de(pagina(
+        bloque("1", "2007-08-09T22:00:00Z", "Aldosivi", "te1",
+               "Almagro", "te2", 0, 0, estado="postponed"))) == []
+
+
+def test_la_jornada_sale_del_encabezado():
+    p = pagina(bloque("1", "2007-08-09T22:00:00Z", "A", "te1", "B", "te2", 1, 0),
+               jornada=25)
+    assert fechas.partidos_de(p)[0].jornada == 25
+
+
+# --------------------------------------------------------------------------
+# deducir el padron sin mirar los nombres
+# --------------------------------------------------------------------------
+def nuestro(local, visita, gl, gv, jornada, fecha=""):
+    return Partido(fecha=fecha, local=local, visita=visita, goles_local=gl,
+                   goles_visita=gv, fase="zonas", jornada=f"Fecha {jornada}")
+
+
+def ajeno(local, visita, gl, gv, jornada, fecha="2007-08-09"):
+    return fechas.Ajeno(fecha=fecha, jornada=jornada, local=local, visita=visita,
+                        goles_local=gl, goles_visita=gv,
+                        id_local=f"te{local}", id_visita=f"te{visita}")
+
+
+def test_deduce_el_padron_por_marcadores_unicos():
+    """La idea: dentro de una jornada, un marcador que aparece UNA sola vez de
+    cada lado identifica el partido sin ambiguedad -- y de paso dice quien es
+    cada uno de los dos equipos, sin depender de como los escriba cada fuente."""
+    nuestros = [nuestro("Aldosivi", "Almagro", 3, 1, 1),
+                nuestro("Aldosivi", "Almagro", 2, 0, 2)]
+    ajenos = [ajeno("A", "B", 3, 1, 1), ajeno("A", "B", 2, 0, 2)]
+    mapa, avisos = fechas.derivar_padron(nuestros, ajenos)
+    assert mapa == {"teA": "Aldosivi", "teB": "Almagro"}
+    assert avisos == []
+
+
+def test_un_marcador_repetido_no_identifica_nada():
+    """Dos 1-0 en la misma fecha no dicen cual es cual. Forzarlo seria adivinar,
+    y un id mal fijado se arrastra a toda la temporada."""
+    nuestros = [nuestro("Aldosivi", "Almagro", 1, 0, 1),
+                nuestro("Belgrano", "Banfield", 1, 0, 1)]
+    ajenos = [ajeno("A", "B", 1, 0, 1), ajeno("C", "D", 1, 0, 1)]
+    mapa, _ = fechas.derivar_padron(nuestros, ajenos)
+    assert mapa == {}
+
+
+def test_hace_falta_mas_de_un_voto():
+    """Con un solo cruce casual alcanzaria para fijar un club equivocado para
+    siempre; pidiendo dos, el error tendria que repetirse en dos jornadas."""
+    nuestros = [nuestro("Aldosivi", "Almagro", 3, 1, 1)]
+    ajenos = [ajeno("A", "B", 3, 1, 1)]
+    mapa, avisos = fechas.derivar_padron(nuestros, ajenos)
+    assert mapa == {}
+    assert any("menos de 2 votos" in a for a in avisos)
+
+
+def test_un_id_con_votos_contradictorios_queda_afuera():
+    nuestros = [nuestro("Aldosivi", "Almagro", 3, 1, 1),
+                nuestro("Belgrano", "Almagro", 2, 0, 2)]
+    ajenos = [ajeno("A", "B", 3, 1, 1), ajeno("A", "B", 2, 0, 2)]
+    mapa, avisos = fechas.derivar_padron(nuestros, ajenos, minimo=1)
+    assert "teA" not in mapa, "un id que voto a dos clubes no puede entrar"
+    assert any("contradictorios" in a for a in avisos)
+
+
+# --------------------------------------------------------------------------
+# completar: lo que importa es cuando NO completa
+# --------------------------------------------------------------------------
+def test_completa_cuando_coincide_todo():
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    n, avisos = fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                                 {"teA": "Aldosivi", "teB": "Almagro"})
+    assert n == 1 and p.fecha == "2007-08-09"
+
+
+def test_NO_completa_si_el_marcador_no_coincide():
+    """EL test del modulo. Paso de verdad: en la Fecha 1 de la B Nacional
+    2007-08, Wikipedia dice que Independiente Rivadavia le gano 1-0 a Tiro
+    Federal y la otra fuente dice lo contrario. Que las dos fuentes se
+    contradigan es informacion; ponerle la fecha igual seria decidir en silencio
+    cual tiene razon.
+    """
+    p = nuestro("Aldosivi", "Almagro", 0, 1, 1)
+    n, avisos = fechas.completar([p], [ajeno("A", "B", 1, 0, 1)],
+                                 {"teA": "Aldosivi", "teB": "Almagro"})
+    assert n == 0 and p.fecha == ""
+    assert any("marcador distinto" in a for a in avisos)
+
+
+def test_no_toca_a_los_que_ya_tienen_fecha():
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-01-01")
+    n, _ = fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                            {"teA": "Aldosivi", "teB": "Almagro"})
+    assert n == 0 and p.fecha == "2007-01-01", "piso una fecha que ya estaba"
+
+
+def test_la_jornada_tambien_tiene_que_coincidir():
+    """Los mismos dos equipos se cruzan dos veces por temporada, ida y vuelta.
+    Sin la jornada, el partido de la primera rueda se llevaria la fecha de la
+    segunda."""
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    n, _ = fechas.completar([p], [ajeno("A", "B", 3, 1, 20)],
+                            {"teA": "Aldosivi", "teB": "Almagro"})
+    assert n == 0 and p.fecha == ""
+
+
+def test_avisa_de_los_nombres_que_no_reconoce():
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    n, avisos = fechas.completar([p], [ajeno("Rarisimo", "Otro", 3, 1, 1)])
+    assert n == 0
+    assert any("padron no conoce" in a for a in avisos)
+
+
+def test_un_marcador_repetido_puede_dar_un_mapeo_consistente_y_FALSO():
+    """El caso que de verdad justifica exigir marcadores unicos.
+
+    Aca el 1-0 se repite del lado de la otra fuente, y el equivocado va siempre
+    primero. Sin el filtro, el cruce elige ese en las dos jornadas: el mapeo sale
+    consistente -- dos votos, ninguna contradiccion -- y por lo tanto ACEPTADO,
+    apuntando al club que no es. Ningun chequeo posterior lo agarraria, porque
+    para todos los demas se ve perfecto.
+
+    Es la diferencia entre un cruce que no identifica y uno que identifica mal.
+    """
+    nuestros = [nuestro("Aldosivi", "Almagro", 1, 0, 1),
+                nuestro("Aldosivi", "Almagro", 1, 0, 2)]
+    ajenos = [ajeno("Falso", "Otro", 1, 0, 1), ajeno("A", "B", 1, 0, 1),
+              ajeno("Falso", "Otro", 1, 0, 2), ajeno("A", "B", 1, 0, 2)]
+    mapa, _ = fechas.derivar_padron(nuestros, ajenos)
+    assert mapa == {}, f"acepto un mapeo sacado de un marcador repetido: {mapa}"
+
+
+# --------------------------------------------------------------------------
+# descubrir competencias y temporadas en el indice del propio sitio
+# --------------------------------------------------------------------------
+SELECTOR = """
+<select>
+<option value="/competition/co103/">Primera División</option>
+<option value="/competition/co1787/">Primera Nacional</option>
+<option value="/competition/co5199/">Primera B Metropolitana</option>
+</select>
+<select>
+<option value="/competition/co1787/argentina-primera-nacional/se112408/2026/all-matches/">2026</option>
+<option value="/competition/co1787/argentina-primera-nacional/se107027/2025-playoffs/all-matches/">2025 Playoffs</option>
+<option value="/competition/co1787/argentina-primera-nacional/se6101/2010-2011/all-matches/">2010/2011</option>
+</select>
+"""
+
+
+def test_las_temporadas_salen_del_selector_del_sitio():
+    """Bajando UNA temporada, su selector lista todas las demas: cinco pedidos
+    alcanzan para catalogar el sitio entero.
+
+    La alternativa que probamos primero -- adivinar slugs legibles del estilo
+    `arg-primera-b-nacional-2010-2011` -- daba 404 en casi todos, porque son
+    atajos que a veces existen y a veces no. La 2010/2011 es justo una de las que
+    no: por slug es 404, por id existe.
+    """
+    t = fechas.temporadas_de(SELECTOR)
+    assert t["2026"] == ("co1787", "se112408")
+    assert t["2010/2011"] == ("co1787", "se6101")
+
+
+def test_aparecen_temporadas_que_uno_no_imaginaria():
+    """"2025 Playoffs", "2024 Relegation", "2025 Gran Final": adivinando nombres
+    no se encuentran, y son partidos igual."""
+    assert fechas.temporadas_de(SELECTOR)["2025 Playoffs"] == ("co1787", "se107027")
+
+
+def test_las_competencias_tambien():
+    assert fechas.competencias_de(SELECTOR) == {
+        "Primera División": "co103",
+        "Primera Nacional": "co1787",
+        "Primera B Metropolitana": "co5199"}
+
+
+def test_una_opcion_que_no_es_competencia_no_entra():
+    """El mismo `<select>` trae paises y federaciones."""
+    otras = '<option value="/matches-today/cy12/">Argentina</option>'
+    assert fechas.competencias_de(otras) == {}
+    assert fechas.temporadas_de(otras) == {}
+
+
+def test_la_url_lleva_competencia_y_temporada():
+    assert fechas.BASE.format(co="co1787", se="se19981").endswith(
+        "/competition/co1787/se19981/all-matches/")
+
+
+# --------------------------------------------------------------------------
+# el credito
+# --------------------------------------------------------------------------
+def test_la_fila_dice_de_donde_salio_la_fecha():
+    """El credito va fila por fila, no en una nota al pie del README.
+
+    Una fila cuya fecha vino de otra fuente lo dice en `source`, junto a la
+    pagina de Wikipedia de la que salio todo lo demas. Un dataset que atribuye
+    mal es un dataset que miente sobre si mismo, y eso es un problema de datos
+    antes que de licencia.
+    """
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                     {"teA": "Aldosivi", "teB": "Almagro"})
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert fila["date"] == "2007-08-09"
+    assert "es.wikipedia.org" in fila["source"]
+    assert "worldfootball" in fila["source"]
+
+
+def test_la_fila_que_no_uso_la_segunda_fuente_no_la_nombra():
+    """La atribucion tiene que ser precisa: nombrar a worldfootball en filas que
+    no lo usaron seria tan incorrecto como no nombrarlo en las que si."""
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-08-09")
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert fila["source"] == "https://es.wikipedia.org/wiki/X"
+
+
+def test_la_fila_puede_traer_SU_fuente_y_pisa_la_del_lector():
+    """`credito` es el del lector entero, pero una fila puede traer el suyo.
+
+    Las fechas citadas a mano de una temporada pueden salir de DOS blogs distintos
+    -- el segundo entra justamente donde el primero publica un dia roto -- y
+    atribuirle las dos al primero seria escribir algo falso en la columna que existe
+    para no hacer eso."""
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    a = ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")
+    fechas.completar([p], [dataclasses.replace(a, fuente="http://otra.fuente/")],
+                     {"teA": "Aldosivi", "teB": "Almagro"}, credito="http://el.lector/")
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert "otra.fuente" in fila["source"]
+    assert "el.lector" not in fila["source"]
+
+
+def test_y_sin_fuente_propia_vale_la_del_lector():
+    """Que es el caso de casi todas: un lector habla con una sola fuente."""
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                     {"teA": "Aldosivi", "teB": "Almagro"}, credito="http://el.lector/")
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert "el.lector" in fila["source"]
+
+
+def test_el_credito_no_se_pone_si_no_se_completo():
+    """Si el marcador no coincide no se completa la fecha, asi que tampoco hay
+    nada que acreditar."""
+    p = nuestro("Aldosivi", "Almagro", 0, 1, 1)
+    fechas.completar([p], [ajeno("A", "B", 1, 0, 1)],
+                     {"teA": "Aldosivi", "teB": "Almagro"})
+    assert p.fuente_fecha == ""
+
+
+def test_el_credito_que_la_fila_ya_traia_se_suma_y_no_se_pisa():
+    """UNA FILA PUEDE NACER DE UNA FUENTE Y FECHARSE CON OTRA, y entonces su
+    `source` nombra tres cosas: la pagina, de donde salio el partido y quien le
+    puso el dia. En ese orden.
+
+    Llega asi --sin fecha y ya con credito-- la fila que nace de una fuente que
+    publica el partido y no el dia. `completar` se quedaba con el ultimo credito:
+    37 filas del Argentino A 2004-05 nombraban al blog que les puso un campo y
+    callaban a RSSSF, de donde sale el partido entero. Nombrar de menos es lo
+    mismo que nombrar de mas, visto desde el otro lado."""
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    p.fuente_fecha = "http://de.donde.nacio/"
+    fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                     {"teA": "Aldosivi", "teB": "Almagro"}, credito="http://quien.la.fecho/")
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert fila["date"] == "2007-08-09"
+    assert fila["source"] == ("https://es.wikipedia.org/wiki/X"
+                              " + http://de.donde.nacio/ + http://quien.la.fecho/")
+
+
+def test_si_la_fecha_la_pone_la_misma_fuente_no_se_la_nombra_dos_veces():
+    """La otra mitad: sumar no es repetir. Si a la fila que nacio de una fuente
+    el dia se lo pone ESA MISMA fuente, el credito es uno solo.
+
+    Hoy no pasa en ninguna fila, y puede pasar: sobre las llaves que nacen de
+    RSSSF sin dia corre tambien el completador de RSSSF, antes que las citas."""
+    from fad import dataset
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    p.fuente_fecha = "http://la.misma/"
+    fechas.completar([p], [ajeno("A", "B", 3, 1, 1, fecha="2007-08-09")],
+                     {"teA": "Aldosivi", "teB": "Almagro"}, credito="http://la.misma/")
+    fila = dataset.a_fila(p, "Primera Nacional", 2007, "https://es.wikipedia.org/wiki/X")
+    assert fila["date"] == "2007-08-09"
+    assert fila["source"] == "https://es.wikipedia.org/wiki/X + http://la.misma/"
+
+
+# --------------------------------------------------------------------------
+# el marcador y el horario tienen la misma forma
+# --------------------------------------------------------------------------
+def test_el_horario_no_es_el_marcador():
+    """`20:30` y `2:0` se escriben igual, y el horario viene primero.
+
+    Este es el bug que las fixtures inventadas no podian ver. El parser tomaba
+    el primer `N:N` del bloque, que es la hora de comienzo, y cargaba partidos
+    terminados 20 a 30. Lo peor no era el dato absurdo: era que el cruce contra
+    Wikipedia reportaba "las dos fuentes dicen marcadores distintos" en 800
+    partidos, y la que decia cualquier cosa era esta.
+    """
+    p, = fechas.partidos_de(pagina(bloque(
+        "1", "2010-08-07T18:30:00Z", "Aldosivi", "te21683",
+        "CAI", "te20759", 0, 1, hora="20:30")))
+    assert (p.goles_local, p.goles_visita) == (0, 1)
+
+
+def test_sin_marcador_no_hay_partido():
+    """Un partido sin `match-result` no se inventa: se saltea.
+
+    Los que todavia no se jugaron traen el div del horario y no el del
+    resultado. Si el parser cayera de vuelta en el primer `N:N` del bloque, un
+    partido a jugarse el sabado a las 20:30 entraria como 20-30."""
+    sin = bloque("1", "2026-08-15T23:30:00Z", "A", "te1", "B", "te2", 0, 0)
+    sin = sin.replace('<div class="match-result match-result-0">'
+                      '<a href="/match-report/x/">0:0</a></div>', "")
+    assert fechas.partidos_de(pagina(sin)) == []
+
+
+# --------------------------------------------------------------------------
+# la derivacion del padron tolera un voto suelto en contra
+# --------------------------------------------------------------------------
+def _cruce(jornada, gl, gv, local, visita, id_local, id_visita):
+    mio = Partido(jornada=f"Fecha {jornada}", local=local, visita=visita,
+                  goles_local=gl, goles_visita=gv, fase="zonas")
+    suyo = fechas.Ajeno(jornada=jornada, fecha="2010-01-01", goles_local=gl,
+                        goles_visita=gv, local=local, visita=visita,
+                        id_local=id_local, id_visita=id_visita)
+    return mio, suyo
+
+
+def test_una_localia_al_reves_no_tira_abajo_al_club():
+    """Un voto en contra entre muchos a favor no invalida el id.
+
+    En la B Nacional 2009-10 Wikipedia anota Ferro 2-2 Union en la fecha 25 y la
+    otra fuente lo da Union 2-2 Ferro. Como el marcador es simetrico, el cruce
+    empareja bien el partido y mal los equipos, y quedaba un voto contradictorio
+    para cada uno de los dos ids. Exigiendo unanimidad, los dos clubes se caian
+    del mapa y con ellos 22 fechas que estaban perfectas.
+    """
+    mios, suyos = [], []
+    for j in range(1, 11):                      # diez votos limpios de cada uno
+        m, s = _cruce(j, j, 0, "Ferro", f"Rival {j}", "teF", f"te{j}")
+        mios.append(m); suyos.append(s)
+    m, s = _cruce(11, 2, 2, "Ferro", "Unión", "teU", "teF")   # el cruzado
+    mios.append(m); suyos.append(s)
+
+    mapa, avisos = fechas.derivar_padron(mios, suyos)
+    assert mapa["teF"] == "Ferro"
+    assert any("minoria" in a for a in avisos)
+
+
+def test_una_mayoria_ajustada_no_alcanza():
+    """Diez a nueve no es un club identificado, es una moneda al aire."""
+    mios, suyos = [], []
+    for j in range(1, 21):
+        quien = "Ferro" if j % 2 else "Unión"
+        m, s = _cruce(j, j, 0, quien, f"Rival {j}", "teX", f"te{j}")
+        mios.append(m); suyos.append(s)
+    mapa, avisos = fechas.derivar_padron(mios, suyos)
+    assert "teX" not in mapa
+    assert any("contradictorios" in a for a in avisos)
+
+
+# --------------------------------------------------------------------------
+# el huso depende de si el sitio sabe la hora
+# --------------------------------------------------------------------------
+def _sin_hora(bloque_html: str) -> str:
+    return bloque_html.replace('<div class="match-time">20:30</div>',
+                               '<div class="match-time match-time-unknown"></div>')
+
+
+def test_cuando_hay_hora_vale_la_fecha_argentina():
+    """`18:30Z` son las 15:30 de Buenos Aires: un sabado a la tarde. El sitio lo
+    muestra como 20:30 porque es aleman, pero la hora que se ve no es la del
+    partido."""
+    p, = fechas.partidos_de(pagina(bloque(
+        "1", "2010-08-07T18:30:00Z", "A", "te1", "B", "te2", 1, 0)))
+    assert p.fecha == "2010-08-07"
+
+
+def test_un_partido_de_noche_no_se_va_al_dia_siguiente():
+    """22:10Z del 7 son las 19:10 del 7, no del 8."""
+    p, = fechas.partidos_de(pagina(bloque(
+        "1", "2010-08-07T22:10:00Z", "A", "te1", "B", "te2", 1, 0)))
+    assert p.fecha == "2010-08-07"
+
+
+def test_sin_hora_el_instante_es_un_relleno_y_no_se_convierte():
+    """Cuando el sitio no sabe la hora, `data-datetime` no es un instante: es la
+    medianoche de ese dia en Berlin. Se nota porque toma DOS valores en toda la
+    temporada, 22:00Z y 23:00Z. Restarle tres horas cae en el dia anterior, y asi
+    quedaron corridos los 760 partidos de 2007-08 y 2008-09 -- cada uno un dia
+    antes del que el propio sitio publica al lado."""
+    p, = fechas.partidos_de(pagina(_sin_hora(bloque(
+        "1", "2007-08-09T22:00:00Z", "A", "te1", "B", "te2", 1, 0))))
+    assert p.fecha == "2007-08-10", "22:00Z es medianoche del 10 en Berlin"
+
+
+def test_sin_hora_en_invierno_europeo_tambien():
+    """En invierno el relleno es 23:00Z, porque Berlin pasa a UTC+1."""
+    p, = fechas.partidos_de(pagina(_sin_hora(bloque(
+        "1", "2007-12-09T23:00:00Z", "A", "te1", "B", "te2", 1, 0))))
+    assert p.fecha == "2007-12-10"
+
+
+def test_el_horario_de_verano_argentino_se_respeta():
+    """Argentina tuvo horario de verano hasta 2009 -- justo en las temporadas que
+    se cargan, al reves de lo que decia el comentario que justificaba el UTC-3
+    fijo. En enero de 2008 el pais estaba en UTC-2.
+
+    El instante esta elegido para que los dos husos den DIAS distintos, que es lo
+    unico que se ve en el dataset: 02:30Z son las 00:30 del 15 en UTC-2 y las
+    23:30 del 14 en UTC-3. Con cualquier otro horario los dos dan el mismo dia y
+    el test no distingue nada."""
+    p, = fechas.partidos_de(pagina(bloque(
+        "1", "2008-01-15T02:30:00Z", "A", "te1", "B", "te2", 1, 0)))
+    assert p.fecha == "2008-01-15", "UTC-2 en enero de 2008: 00:30 del 15"
+
+
+def test_fuera_del_horario_de_verano_vale_el_UTC_menos_3():
+    """En julio de 2008 Argentina estaba en UTC-3: el mismo instante cae el 14."""
+    p, = fechas.partidos_de(pagina(bloque(
+        "1", "2008-07-15T02:30:00Z", "A", "te1", "B", "te2", 1, 0)))
+    assert p.fecha == "2008-07-14"
+
+
+# --------------------------------------------------------------------------
+# la cache no se envenena
+# --------------------------------------------------------------------------
+def test_no_se_cachea_una_respuesta_que_no_es_la_pagina(monkeypatch, tmp_path):
+    """Un interstitial de firewall o un "access denied" se sirven con status 200
+    igual que la pagina buena. Guardado, queda para siempre: todas las corridas
+    siguientes leen ESE archivo y devuelven cero partidos sin dar ningun error.
+    """
+    import urllib.request
+
+    class Respuesta:
+        headers = {"Content-Type": "text/html; charset=utf-8"}
+        def read(self): return b"<html>Access denied</html>"
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr(fechas, "CACHE", tmp_path)
+    monkeypatch.setattr(fechas, "PAUSA_MIN", 0)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: Respuesta())
+    with pytest.raises(OSError, match="no parece una pagina"):
+        fechas.descargar("co1", "se1")
+    assert list(tmp_path.glob("*.html")) == [], "no tiene que quedar nada guardado"
+
+
+def test_la_pausa_cuenta_tambien_los_pedidos_que_fallan(monkeypatch, tmp_path):
+    """La autolimitacion se desactivaba justo cuando el sitio dice que no: el
+    reloj se tocaba despues del pedido exitoso, asi que cuatro 403 salian uno
+    atras del otro sin esperar nada."""
+    import urllib.request
+    monkeypatch.setattr(fechas, "CACHE", tmp_path)
+    monkeypatch.setattr(fechas, "_ULTIMO", 0.0)
+
+    def bloqueado(*a, **k):
+        raise OSError("HTTP Error 403: Forbidden")
+
+    monkeypatch.setattr(urllib.request, "urlopen", bloqueado)
+    with pytest.raises(OSError):
+        fechas.descargar("co1", "se1")
+    assert fechas._ULTIMO > 0, "un pedido que fallo tambien es un pedido"
+
+
+# --------------------------------------------------------------------------
+# dos partidos indistinguibles no identifican a ninguno
+# --------------------------------------------------------------------------
+def test_dos_ajenos_con_la_misma_clave_se_descartan_los_dos():
+    """Si dos partidos de la otra fuente comparten jornada y los dos equipos, no
+    hay forma de saber cual es cual. Antes el segundo pisaba al primero en
+    silencio y se importaba la fecha del partido equivocado."""
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    ajenos = [ajeno("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-08-09"),
+              ajeno("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-11-30")]
+    n, avisos = fechas.completar([p], ajenos)
+    assert (n, p.fecha) == (0, "")
+    assert any("no identifican nada" in a for a in avisos)
+
+
+def test_un_partido_arbitrado_toma_la_fecha_igual():
+    """`completar` usa el marcador para verificar que las dos fuentes hablan del
+    mismo partido. Cuando el emparejamiento ya se confirmo por otro lado -- la
+    tabla de posiciones de la propia pagina -- el marcador ya no hace falta como
+    verificacion, y la fecha se toma. Es el caso de Talleres 0-4 Atlético
+    Tucumán, donde la tabla le da la razon a Wikipedia y no a la otra fuente."""
+    p = nuestro("Aldosivi", "Almagro", 0, 4, 36)
+    ajenos = [ajeno("Aldosivi", "Almagro", 1, 4, 36, fecha="2009-06-06")]
+    n, avisos = fechas.completar([p], ajenos,
+                                 arbitrados={("Fecha 36", "Aldosivi", "Almagro")})
+    assert (n, p.fecha) == (1, "2009-06-06")
+    assert (p.goles_local, p.goles_visita) == (0, 4), "el marcador nuestro no se toca"
+    assert any("ya esta arbitrado" in a for a in avisos)
+
+
+def test_sin_arbitrar_el_marcador_distinto_sigue_frenando():
+    """La excepcion se nombra partido por partido. Sin la lista, la regla vale."""
+    p = nuestro("Aldosivi", "Almagro", 0, 4, 36)
+    ajenos = [ajeno("Aldosivi", "Almagro", 1, 4, 36, fecha="2009-06-06")]
+    n, avisos = fechas.completar([p], ajenos)
+    assert (n, p.fecha) == (0, "")
+    assert any("no se completo" in a for a in avisos)
+
+
+def test_la_llave_separa_dos_torneos_que_numeran_igual_sus_jornadas():
+    """Una pagina puede traer DOS torneos con Fecha 1 a 11 cada uno: el Argentino
+    A 2005-06 tiene Apertura y Clausura. Sin la llave, "Fecha 5 Douglas Haig vs
+    Cipolletti" es una sola casilla para dos partidos distintos.
+
+    Y no es teorico. Esa pagina copio las tablas de dos jornadas del Clausura
+    dentro del Apertura, asi que las mismas veinte filas aparecen en los dos. Con
+    la clave vieja las del Apertura se llevaban la fecha del Clausura -- febrero
+    de 2006, imposible para el Apertura, que se jugo de agosto a diciembre de
+    2005 -- y quedaban con un dato plausible y falso."""
+    a = nuestro("Douglas Haig", "Cipolletti", 5, 3, 5)
+    a.llave = "Torneo Apertura"
+    c = nuestro("Douglas Haig", "Cipolletti", 5, 3, 5)
+    c.llave = "Torneo Clausura"
+    ajenos = [fechas.Ajeno(fecha="2005-09-25", jornada=5, local="Douglas Haig",
+                           visita="Cipolletti", goles_local=5, goles_visita=3,
+                           llave="Torneo Apertura"),
+              fechas.Ajeno(fecha="2006-02-11", jornada=5, local="Douglas Haig",
+                           visita="Cipolletti", goles_local=5, goles_visita=3,
+                           llave="Torneo Clausura")]
+    n, _ = fechas.completar([a, c], ajenos)
+    assert n == 2
+    assert a.fecha == "2005-09-25"
+    assert c.fecha == "2006-02-11"
+
+
+def test_sin_llave_dos_ajenos_iguales_siguen_chocando():
+    """La llave hace la clave mas fina, no mas floja: si la fuente NO distingue
+    -- worldfootball no lo hace -- dos ajenos en la misma casilla se siguen
+    sacando los dos."""
+    p = nuestro("Aldosivi", "Almagro", 3, 1, 1)
+    ajenos = [ajeno("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-08-09"),
+              ajeno("Aldosivi", "Almagro", 3, 1, 1, fecha="2007-11-30")]
+    n, avisos = fechas.completar([p], ajenos)
+    assert n == 0 and not p.fecha
+    assert any("dos veces" in a for a in avisos)
+
+
+# --------------------------------------------------------------------------
+# cuando la fuente no publica el numero de jornada
+# --------------------------------------------------------------------------
+def sin_jornada(local, visita, gl, gv, fecha):
+    """Como los emite `citadas.ajenos`: la fuente citada no trae la jornada."""
+    return fechas.Ajeno(fecha=fecha, jornada=0, local=local, visita=visita,
+                        goles_local=gl, goles_visita=gv)
+
+
+def test_una_fuente_sin_jornada_empareja_por_el_par_de_clubes():
+    """Hay fuentes que no publican la jornada: las citas a mano, y antes el feed de
+    ESPN, para el que se escribio esto. No se afloja la regla, se le cambia
+    el identificador: en una liga de ida y vuelta cada par se cruza UNA VEZ EN
+    CADA CANCHA, asi que (local, visita) ya identifica el partido.
+
+    Medido antes de decidirlo, sobre nuestros propios datos: 384 pares distintos
+    sobre 384 partidos en la Primera C 2008-09."""
+    a = nuestro("San Miguel", "Sacachispas", 0, 1, 1)
+    b = nuestro("Sacachispas", "San Miguel", 2, 2, 20)
+    n, _ = fechas.completar([a, b], [sin_jornada("San Miguel", "Sacachispas", 0, 1, "2009-08-22"),
+                                     sin_jornada("Sacachispas", "San Miguel", 2, 2, "2010-03-14")])
+    assert n == 2
+    assert a.fecha == "2009-08-22", "la ida"
+    assert b.fecha == "2010-03-14", "la vuelta, en la otra cancha"
+
+
+def test_sin_jornada_la_jornada_nuestra_deja_de_importar():
+    """El testigo de que de verdad se ignora: la fuente no sabe que este partido
+    es de la Fecha 7, y la fecha se completa igual."""
+    p = nuestro("San Miguel", "Sacachispas", 0, 1, 7)
+    n, _ = fechas.completar([p], [sin_jornada("San Miguel", "Sacachispas", 0, 1, "2009-09-19")])
+    assert n == 1 and p.fecha == "2009-09-19"
+
+
+def test_sin_jornada_el_marcador_sigue_verificando():
+    """Lo unico que no se toca. El identificador cambio; la verificacion no."""
+    p = nuestro("San Miguel", "Sacachispas", 0, 1, 7)
+    n, avisos = fechas.completar([p], [sin_jornada("San Miguel", "Sacachispas", 3, 0, "2009-09-19")])
+    assert n == 0 and not p.fecha
+    assert any("marcador distinto" in a for a in avisos)
+
+
+def test_sin_jornada_un_par_repetido_se_descarta_entero():
+    """Los playoffs vuelven a cruzar a los mismos dos clubes, y ahi el par deja
+    de identificar. Es la mayor parte de las filas que siguen sin fecha, y es la
+    regla de colision haciendo su trabajo: lo que no identifica uno solo, no
+    identifica nada."""
+    p = nuestro("San Miguel", "Sacachispas", 0, 1, 7)
+    n, avisos = fechas.completar([p], [sin_jornada("San Miguel", "Sacachispas", 0, 1, "2009-09-19"),
+                                       sin_jornada("San Miguel", "Sacachispas", 0, 1, "2010-06-05")])
+    assert n == 0 and not p.fecha
+    assert any("dos veces" in a for a in avisos)
+
+
+def test_dos_filas_nuestras_en_la_misma_casilla_las_desempata_el_marcador():
+    """LA REGLA DE COLISION TAMBIEN VALE DE ESTE LADO.
+
+    Cuando la fuente no numera la jornada, el identificador es el par de clubes
+    mas la llave, y eso puede enganchar VARIAS filas nuestras: en el Argentino A
+    2004-05 la fase regular y las rondas de la Segunda Fase comparten `llave`
+    --las dos son "Torneo Apertura"--, asi que el mismo cruce aparece dos veces.
+
+    No llegaba a escribir una fecha equivocada, porque el marcador verifica antes.
+    Lo que si hacia era denunciar un desacuerdo INEXISTENTE: la fila de la ronda
+    se comparaba contra la cita de la fase regular y el aviso decia "esta fuente
+    la da distinta" sobre dos partidos distintos.
+
+    El marcador --que ya es el verificador-- desempata, y solo si deja UNA."""
+    regular = Partido(local="Gimnasia y Tiro (S)", visita="Atlético Tucumán",
+                      goles_local=2, goles_visita=1, fase="zonas",
+                      jornada="Fecha 5", llave="Torneo Apertura")
+    ronda = Partido(fecha="2004-12-08", local="Gimnasia y Tiro (S)",
+                    visita="Atlético Tucumán", goles_local=4, goles_visita=0,
+                    fase="eliminacion", jornada="Tercera ronda",
+                    llave="Torneo Apertura")
+    ajeno = fechas.Ajeno(fecha="2004-10-10", jornada=0, llave="Torneo Apertura",
+                         local="Gimnasia y Tiro (S)", visita="Atlético Tucumán",
+                         goles_local=2, goles_visita=1)
+
+    puestas, avisos = fechas.completar([regular, ronda], [ajeno])
+    assert (puestas, regular.fecha) == (1, "2004-10-10"), avisos
+    assert ronda.fecha == "2004-12-08", "no se le toca la fecha que ya tenia"
+    assert not any("la da distinta" in a for a in avisos), avisos
+
+
+def test_si_el_marcador_tampoco_desempata_no_se_completa_nada():
+    """LO QUE NO IDENTIFICA UNO SOLO NO IDENTIFICA NADA, tambien aca.
+
+    El marcador desempata entre las filas nuestras que comparten casilla, pero
+    solo sirve si deja UNA. Si dos de ellas tienen el mismo marcador que el
+    ajeno, no se sabe de cual habla la fuente y no se completa ninguna: tomar la
+    primera seria elegir por orden de aparicion, que es exactamente el arbitro
+    que este modulo dejo de aceptar."""
+    una = Partido(local="Boca Juniors", visita="River Plate", goles_local=1,
+                  goles_visita=0, fase="zonas", jornada="Fecha 5", llave="A")
+    otra = Partido(local="Boca Juniors", visita="River Plate", goles_local=1,
+                   goles_visita=0, fase="eliminacion", jornada="Semifinal", llave="A")
+    ajeno = fechas.Ajeno(fecha="2010-03-05", jornada=0, llave="A",
+                         local="Boca Juniors", visita="River Plate",
+                         goles_local=1, goles_visita=0)
+
+    puestas, avisos = fechas.completar([una, otra], [ajeno])
+    assert puestas == 0, avisos
+    assert (una.fecha, otra.fecha) == ("", "")
+
+
+def test_una_ronda_de_eliminacion_no_tiene_numero_de_fecha():
+    """`1/8 Finals` NO ES LA FECHA 1, aunque tenga un uno adelante.
+
+    `_numero` devuelve el primer digito del nombre, y el de `1/8 Finals - First
+    leg` es el uno de "1/8". Con eso, esas filas compartian clave con la Round 1
+    de la fase regular: en el Argentino A 2005-06 la ida de los octavos se
+    comparaba contra `Villa Mitre 2-1 Sportivo Desamparados` de la primera fecha
+    del Clausura. Con el marcador coincidiendo habria escrito la fecha
+    equivocada.
+
+    Se pregunta por la FASE y no por como esta escrita la etiqueta."""
+    octavos = Partido(local="Villa Mitre", visita="Desamparados", goles_local=1,
+                      goles_visita=2, fase="eliminacion",
+                      jornada="1/8 Finals - First leg", llave="Torneo Clausura")
+    primera = fechas.Ajeno(fecha="2006-01-15", jornada=1, llave="Torneo Clausura",
+                           local="Villa Mitre", visita="Desamparados",
+                           goles_local=1, goles_visita=2)
+
+    puestas, avisos = fechas.completar([octavos], [primera])
+    assert (puestas, octavos.fecha) == (0, ""), avisos
+    assert any("sin pareja" in a for a in avisos), avisos
+
+
+# --------------------------------------------------------------------------
+# Dos fuentes que dan dias distintos
+# --------------------------------------------------------------------------
+def _p(fecha, gl=2, gv=1):
+    from fad.parser import Partido
+    return Partido(fecha=fecha, local="Boca Juniors", visita="River Plate",
+                   goles_local=gl, goles_visita=gv, fase="zonas", jornada="Fecha 1")
+
+
+def _a(fecha, gl=2, gv=1):
+    return fechas.Ajeno(fecha=fecha, jornada=1, local="Boca Juniors",
+                        visita="River Plate", goles_local=gl, goles_visita=gv)
+
+
+def test_un_desacuerdo_de_dia_ya_verificado_no_se_repite():
+    """El gemelo de `Revisado` para los dias: verificar y no anotarlo se parece
+    demasiado a no haber mirado.
+
+    Cuando dos fuentes dan un partido en dias distintos hay dos desenlaces. Si la
+    nuestra esta mal habria que corregirla; si esta bien no hay NADA que tocar, y
+    hasta ahora ese caso no tenia donde escribirse: el aviso volvia en cada
+    corrida y el proximo que pasara lo investigaba de cero.
+
+    Se pide la tupla ENTERA, con las dos fechas. Si alguna de las dos fuentes
+    cambia de opinion la declaracion deja de enganchar y el aviso vuelve, que es
+    lo que tiene que pasar: lo que se verifico era ESE desacuerdo y no otro.
+    """
+    nuestro = _p("2010-03-01")
+    mirado = {("Fecha 1", "Boca Juniors", "River Plate", "2010-03-01", "2010-03-08")}
+    _, avisos = fechas.completar([nuestro], [_a("2010-03-08")], verificadas=mirado)
+    assert not any("la da distinta" in a for a in avisos), avisos
+    assert nuestro.fecha == "2010-03-01", "no se toca el dato, solo el aviso"
+
+    # y si la otra fuente cambia de dia, la declaracion ya no habla de eso
+    otro = _p("2010-03-01")
+    _, avisos = fechas.completar([otro], [_a("2010-03-09")], verificadas=mirado)
+    assert any("la da distinta" in a for a in avisos), avisos
+
+
+def test_las_verificadas_que_engancharon_se_avisan_al_llamador():
+    """`completar` no puede decidir si una declaracion quedo huerfana: una pagina
+    pasa por VARIOS completadores y cada uno ve solo los desacuerdos que a el le
+    tocan. Lo que hace es anotar cuales engancharon; quien avisa es `procesar`,
+    que sabe cuando se termino la pagina.
+
+    Se aprendio poniendo la guarda adentro: las cinco declaraciones del Argentino
+    A 2012-13 se reparten entre dos completadores y cada uno denunciaba como
+    huerfanas las del otro."""
+    mirado = {("Fecha 1", "Boca Juniors", "River Plate", "2010-03-01", "2010-03-08")}
+    usadas: set = set()
+    fechas.completar([_p("2010-03-01")], [_a("2010-03-08")],
+                     verificadas=mirado, usadas=usadas)
+    assert usadas == mirado
+
+    # y con una que no engancha, el conjunto queda vacio y el llamador se entera
+    vacias: set = set()
+    fechas.completar([_p("2010-03-01")], [_a("2010-03-09")],
+                     verificadas=mirado, usadas=vacias)
+    assert vacias == set()
+
+
+def test_una_fecha_ZANJADA_A_MANO_calla_cualquier_desacuerdo():
+    """La forma corta, de tres campos, que usan las `Dia`.
+
+    La larga dice "de ESTE desacuerdo ya sabemos" y caduca si alguna de las dos
+    fuentes cambia de opinion. La corta dice algo mas fuerte -- "la fecha de este
+    partido se corrigio a mano" -- y por eso no puede llevar las dos fechas: la
+    correccion mueve la nuestra, asi que la tupla larga que la describia deja de
+    existir en el momento mismo en que se aplica.
+    """
+    nuestro = _p("2010-03-02")          # ya corregido a mano
+    zanjado = {("Fecha 1", "Boca Juniors", "River Plate")}
+    _, avisos = fechas.completar([nuestro], [_a("2010-03-08")], verificadas=zanjado)
+    assert not any("la da distinta" in a for a in avisos), avisos
+
+    # y sigue callando aunque la otra fuente cambie de dia, que es la diferencia
+    # con la forma larga
+    otro = _p("2010-03-02")
+    _, avisos = fechas.completar([otro], [_a("2010-03-09")], verificadas=zanjado)
+    assert not any("la da distinta" in a for a in avisos), avisos
+
+    # pero es de ESA fila y no de la jornada entera
+    ajeno = {("Fecha 1", "Vélez Sarsfield", "River Plate")}
+    _, avisos = fechas.completar([_p("2010-03-02")], [_a("2010-03-08")],
+                                 verificadas=ajeno)
+    assert any("la da distinta" in a for a in avisos), avisos
+
+
+def test_la_forma_corta_tambien_se_avisa_al_llamador():
+    """Si no volviera, `procesar` la denunciaria como huerfana en cada corrida:
+    la guarda compara lo declarado contra lo que engancho, y una declaracion que
+    funciona pero no se anota es indistinguible de una que no engancho."""
+    zanjado = {("Fecha 1", "Boca Juniors", "River Plate")}
+    usadas: set = set()
+    fechas.completar([_p("2010-03-02")], [_a("2010-03-08")],
+                     verificadas=zanjado, usadas=usadas)
+    assert usadas == zanjado
+
+
+def test_una_fecha_que_ya_estaba_y_la_fuente_contradice_se_denuncia():
+    """SALTEAR EN SILENCIO CONVIERTE EL ORDEN EN EL ARBITRO. El completador se
+    salteaba las filas que ya tenian fecha, asi que el primero que corriera ganaba
+    y el segundo no decia nada. Se vio al enchufar RSSSF a temporadas que ya
+    fechaba ESPN: veintitres filas cambiaron de dia sin que nada lo denunciara, y
+    una de ellas por dieciseis dias.
+
+    Medido sobre el corpus, son 46 partidos en diez paginas, y varios ya estaban
+    ahi de antes: el chequeo no destapa una consecuencia del cambio, destapa un
+    punto ciego.
+    """
+    nuestro = _p("2010-03-01")
+    puestas, avisos = fechas.completar([nuestro], [_a("2010-03-08")])
+    assert puestas == 0
+    assert nuestro.fecha == "2010-03-01", "no se pisa la que ya estaba"
+    assert any("la da distinta" in a for a in avisos)
+
+
+def test_si_las_dos_fuentes_coinciden_no_se_dice_nada():
+    """El testigo del de arriba: lo que se denuncia es el desacuerdo, no el
+    solapamiento."""
+    assert fechas.completar([_p("2010-03-01")], [_a("2010-03-01")]) == (0, [])
+
+
+def test_una_fuente_sin_fecha_no_contradice_a_nadie():
+    """Vacio no es un desacuerdo. Es lo mismo que decir "no se"."""
+    assert fechas.completar([_p("2010-03-01")], [_a("")]) == (0, [])

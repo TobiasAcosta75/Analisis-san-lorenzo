@@ -1,0 +1,130 @@
+name: actualizar dataset
+
+# Todos los dias a las 12:00 UTC = 09:00 en Argentina. Los partidos de la noche
+# anterior terminan cerca de la 1 AM y Wikipedia los carga en las horas
+# siguientes, asi que a la manana ya estan.
+on:
+  schedule:
+    # A las 11:23 y no a las 12 en punto. El comienzo de hora es donde se
+    # amontonan los cron de todo el mundo y GitHub encola los `schedule`, que
+    # son best-effort. Con "0 12" el disparo se venia atrasando media hora, y
+    # el 27 y el 28/08 salio 9h35 y 9h38 tarde -- dos dias cayendo en la misma
+    # ventana de tres minutos, que ya no parece ruido de cola.
+    - cron: "23 11 * * *"
+  workflow_dispatch:        # para poder correrlo a mano
+
+# Solo escribir el repo. El token por defecto alcanza y no hay que crear secrets.
+permissions:
+  contents: write
+
+# Si un dia el job tarda mas de la cuenta, que no se pisen dos corridas
+# escribiendo el mismo archivo.
+concurrency:
+  group: actualizar-dataset
+  cancel-in-progress: false
+
+jobs:
+  actualizar:
+    runs-on: ubuntu-latest
+
+    steps:
+      # node24, igual que en tests.yml: las v4/v5 son node20 y GitHub lo esta
+      # sacando del runner.
+      #
+      # Ojo al subir esto: el `git push` de mas abajo no pasa ningun token, o sea
+      # que se apoya en que checkout deje las credenciales persistidas. Se
+      # verifico contra el action.yml de v5 antes de bumpear -- `persist-credentials`
+      # sigue con `default: true`, byte a byte igual que en v4 -- y en la linea v5
+      # siguen yendo al git config local. Recien en v6 se mudan a un archivo
+      # aparte bajo $RUNNER_TEMP, enganchado con `includeIf.gitdir`: el push
+      # tambien anda, pero es otro mecanismo, y por eso este pin se queda en v5.
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      # La suite corre ANTES de tocar los datos. Si algo del parser se rompio,
+      # mejor enterarse sin haber commiteado un dataset mal armado.
+      - name: Correr la suite
+        run: |
+          python -m pip install --quiet pytest
+          python -m pytest tests/ -q
+
+      # `build.py` sale distinto de cero si hay un aviso grave o si el dataset se
+      # achico, y en esos casos NO escribe nada. O sea que un fallo acá deja el
+      # dataset de ayer intacto, que es lo que corresponde: el modo de fallar de
+      # un scraper no es explotar, es escribir algo plausible y equivocado.
+      - name: Reconstruir el dataset
+        id: build
+        run: |
+          set -o pipefail
+          python build.py 2>&1 | tee salida.txt
+
+      - name: Ver si cambio algo
+        id: cambios
+        run: |
+          # Se STAGEA ANTES de preguntar, y se pregunta contra el INDICE. El gate
+          # era `git diff --quiet -- data/`, que compara el working tree contra el
+          # indice y por lo tanto NO VE un archivo que todavia no esta trackeado.
+          # Y `escribir_por_temporada` escribe UN ARCHIVO POR TEMPORADA, asi que la
+          # primera corrida de una temporada nueva -- el 2027, o la primera vez que
+          # una temporada estrena `data/sin-fecha/` -- salia `hay=no`: el commit se
+          # salteaba por el `if` de abajo y el resumen decia "Sin cambios". El
+          # archivo no se publicaba nunca, en silencio.
+          #
+          # Es el mismo modo de falla que cuenta el parrafo de aca abajo, corrido
+          # una casilla mas arriba: aquella vez el ciego fue el reporte, esta vez
+          # el gate. Por eso ahora las tres cosas -- preguntar, medir y commitear --
+          # miran el mismo indice, que es la unica forma de que no se separen otra
+          # vez.
+          #
+          # Medido antes de escribirlo: `git add data/` ya stagea altas Y bajas,
+          # no hace falta `-A`.
+          git add data/
+          if git diff --cached --quiet -- data/; then
+            echo "hay=no" >> "$GITHUB_OUTPUT"
+          else
+            echo "hay=si" >> "$GITHUB_OUTPUT"
+            # Se mide sobre el indice -- LO MISMO que mira el `if` de arriba -- y
+            # no sobre un nombre escrito a mano. Asi fue como esto se rompio: decia
+            # `data/partidos.csv`, despues el dataset se partio por anio, y el
+            # numstat de un archivo que ya no existe no devuelve nada. Seis
+            # corridas seguidas commitearon "Actualizar dataset ( filas)" sin que
+            # nadie se enterara, porque el commit igual entraba: el reporte quedo
+            # ciego y el trabajo siguio andando.
+            delta=$(git diff --cached --numstat -- data/ \
+              | awk '{a+=$1; b+=$2; n++} END {if (n) printf "+%d -%d filas en %d archivo(s)", a, b, n}')
+            # Y si sale vacio se dice, en vez de dejar un parentesis mudo.
+            echo "delta=${delta:-sin detalle}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commitear
+        if: steps.cambios.outputs.hay == 'si'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data/          # ya lo hizo el paso de arriba; queda por si acaso
+          git commit -m "Actualizar dataset (${{ steps.cambios.outputs.delta }})" \
+                     -m "Automático: $(date -u +%Y-%m-%d). Fuente: Wikipedia en español."
+          git push
+
+      # Los avisos NO graves no frenan nada, pero conviene poder leerlos sin
+      # abrir el log: un torneo en curso siempre tiene alguno, y ahi entre el
+      # ruido esperable puede aparecer uno que no lo es.
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "## Dataset"
+            echo ""
+            if [ "${{ steps.cambios.outputs.hay }}" = "si" ]; then
+              echo "Cambio: \`${{ steps.cambios.outputs.delta }}\` — commiteado."
+            else
+              echo "Sin cambios."
+            fi
+            echo ""
+            echo '```'
+            cat salida.txt 2>/dev/null || echo "(el build no llego a correr)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

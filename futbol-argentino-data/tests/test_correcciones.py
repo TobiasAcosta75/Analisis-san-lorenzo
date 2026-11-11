@@ -1,0 +1,917 @@
+#!/usr/bin/env python3
+"""Tests de las correcciones a mano.
+
+Este modulo es el unico lugar del proyecto donde se sobrescribe lo que dice la
+fuente, asi que lo que hay que probar no es que corrija -- eso es una asignacion
+-- sino que **se niegue a corregir** cuando no esta parada sobre el partido que
+cree. Una correccion que engancha donde no debe no falla: cambia un club por otro
+y el dataset queda mintiendo con toda confianza.
+"""
+from __future__ import annotations
+
+from dataclasses import replace
+
+from fad import correcciones
+from fad.correcciones import Correccion
+from fad.parser import Partido
+
+
+def partido(local, visita, gl=0, gv=0, jornada="Fecha 12"):
+    return Partido(fecha="2009-10-29", local=local, visita=visita, goles_local=gl,
+                   goles_visita=gv, fase="zonas", jornada=jornada)
+
+
+UNA = Correccion(pagina="Una Pagina", jornada="Fecha 12",
+                 dice=("All Boys", "Belgrano", 0, 0),
+                 debe=("All Boys", "Gimnasia y Esgrima (J)"),
+                 porque="de prueba")
+
+
+def con(monkeypatch, *cs):
+    monkeypatch.setattr(correcciones, "CORRECCIONES", cs)
+
+
+def test_corrige_el_partido_que_identifica(monkeypatch):
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Belgrano")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (1, [])
+    assert (ps[0].local, ps[0].visita) == ("All Boys", "Gimnasia y Esgrima (J)")
+
+
+def test_el_espejo_de_localia_da_vuelta_tambien_el_marcador(monkeypatch):
+    """SI LOS CLUBES CAMBIAN DE LADO, LOS GOLES VAN CON ELLOS.
+
+    Una correccion de localia no cambia el RESULTADO, cambia como se escribe:
+    `2-3` visto desde el otro lado es `3-2`. Mover los nombres y dejar los goles
+    donde estaban convierte una victoria en una derrota.
+
+    No se notaba porque los tres espejos que habia en el repo eran EMPATES, donde
+    dar vuelta el marcador no hace nada. El primero que no lo es --la ida de la
+    Tercera Fase del Argentino A 2010-11-- habria quedado con el ganador
+    cambiado."""
+    espejo = Correccion(pagina="Una Pagina", jornada="Fecha 12",
+                        dice=("Unión (MdP)", "Desamparados", 2, 3),
+                        debe=("Desamparados", "Unión (MdP)"),
+                        porque="de prueba")
+    con(monkeypatch, espejo)
+    ps = [partido("Unión (MdP)", "Desamparados", 2, 3)]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (1, [])
+    assert (ps[0].local, ps[0].goles_local,
+            ps[0].goles_visita, ps[0].visita) == ("Desamparados", 3, 2, "Unión (MdP)")
+
+
+def test_dos_espejos_de_la_misma_llave_no_se_pisan(monkeypatch):
+    """CADA CORRECCION CONSUME UNA FILA.
+
+    Al dar vuelta la IDA queda escrita igual que la vuelta --mismo par, mismo
+    marcador--, y en una llave que termino empatada las dos patas son identicas.
+    Sin sacar de la vista lo ya corregido, la correccion de la vuelta encuentra
+    DOS candidatos y se niega a aplicarse: es la regla de "uno solo" disparando
+    contra un candidato que ella misma acaba de fabricar.
+
+    Es el caso de `Ramón Santamarina 2-2 Racing (O)` y de
+    `Talleres (C) 1-1 Racing (C)`, Cuarta fase del Argentino A 2011-12."""
+    ida = Correccion(pagina="Una Pagina", jornada="Cuarta fase",
+                     dice=("Ramón Santamarina", "Racing (O)", 2, 2),
+                     debe=("Racing (O)", "Ramón Santamarina"), porque="de prueba")
+    vuelta = Correccion(pagina="Una Pagina", jornada="Cuarta fase",
+                        dice=("Racing (O)", "Ramón Santamarina", 2, 2),
+                        debe=("Ramón Santamarina", "Racing (O)"), porque="de prueba")
+    con(monkeypatch, ida, vuelta)
+    ps = [partido("Ramón Santamarina", "Racing (O)", 2, 2, jornada="Cuarta fase"),
+          partido("Racing (O)", "Ramón Santamarina", 2, 2, jornada="Cuarta fase")]
+
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (2, []), avisos
+    assert [(p.local, p.visita) for p in ps] == [
+        ("Racing (O)", "Ramón Santamarina"), ("Ramón Santamarina", "Racing (O)")]
+
+
+def test_la_correccion_de_nombre_no_toca_el_marcador(monkeypatch):
+    """LA OTRA MITAD, Y ES LA MAYORIA. Dieciseis de las diecinueve correcciones
+    arreglan la IDENTIDAD de un club --"Unión" era el de Mar del Plata y no el de
+    Sunchales--: el partido es el mismo, quien jugo en su casa es el mismo, y los
+    goles se quedan donde estan. Si el espejo se detectara por "cambio algun
+    nombre" en vez de por "es el par dado vuelta", estas quedarian dadas vuelta
+    tambien."""
+    con(monkeypatch, Correccion(pagina="Una Pagina", jornada="Fecha 12",
+                                dice=("Villa Mitre", "Unión (S)", 0, 1),
+                                debe=("Villa Mitre", "Unión (MdP)"),
+                                porque="de prueba"))
+    ps = [partido("Villa Mitre", "Unión (S)", 0, 1)]
+    n, _ = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, ps[0].goles_local, ps[0].goles_visita) == (1, 0, 1)
+    assert (ps[0].local, ps[0].visita) == ("Villa Mitre", "Unión (MdP)")
+
+
+def test_no_toca_los_partidos_de_otra_pagina(monkeypatch):
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Belgrano")]
+    n, _ = correcciones.aplicar(ps, "Otra Pagina")
+    assert (n, ps[0].visita) == (0, "Belgrano")
+
+
+def test_el_marcador_es_parte_de_la_identificacion(monkeypatch):
+    """All Boys y Belgrano se cruzan dos veces por temporada. Sin el marcador, la
+    correccion podria caer sobre el otro partido."""
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Belgrano", 2, 1)]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0
+    assert ps[0].visita == "Belgrano"
+    assert any("ya no engancha" in a for a in avisos)
+
+
+def test_la_jornada_tambien(monkeypatch):
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Belgrano", jornada="Fecha 31")]
+    n, _ = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0
+
+
+def test_una_correccion_que_ya_no_aplica_avisa(monkeypatch):
+    """Cuando alguien arregle la pagina en Wikipedia, esta entrada queda al pedo.
+    Si se callara, quedaria ahi para siempre esperando enganchar con algo."""
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Gimnasia y Esgrima (J)")]   # ya corregido en la fuente
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0
+    assert any("sacala de fad/correcciones.py" in a for a in avisos)
+
+
+def test_si_engancha_con_dos_no_corrige_ninguno(monkeypatch):
+    """Ante la duda, no se toca nada: elegir uno de los dos seria adivinar."""
+    con(monkeypatch, UNA)
+    ps = [partido("All Boys", "Belgrano"), partido("All Boys", "Belgrano")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0
+    assert all(p.visita == "Belgrano" for p in ps)
+    assert any("2 partidos" in a for a in avisos)
+
+
+# --------------------------------------------------------------------------
+# la tabla de verdad
+# --------------------------------------------------------------------------
+def test_todas_las_correcciones_estan_justificadas():
+    """Sin evidencia escrita no entra: es la unica defensa contra que esto se
+    convierta en el lugar donde se arregla cualquier dato molesto."""
+    for c in correcciones.CORRECCIONES:
+        assert len(c.porque) > 80, f"{c.pagina} {c.jornada}: la evidencia es muy flaca"
+        assert c.dice[:2] != c.debe, "una correccion que no cambia nada"
+
+
+def test_las_correcciones_usan_nombres_del_padron():
+    """`debe` va en canonico. Un nombre que el padron no conoce dejaria el
+    partido peor de lo que estaba, y `nombres_en_el_padron` recien lo agarraria
+    despues."""
+    from fad import equipos
+    for c in correcciones.CORRECCIONES:
+        for n in c.debe:
+            assert equipos.buscar(n) is not None, f"{n!r} no esta en el padron"
+
+
+def test_un_marcador_arbitrado_que_ya_no_engancha_avisa(monkeypatch):
+    """Si Wikipedia corrige el marcador, el arbitraje queda sin efecto. Tiene que
+    decirlo en vez de reventar o de tocar el partido que no es.
+
+    LO SIGUE DICIENDO, PERO POR OTRO CANAL, y ese es el cambio del 26/09/2026. La
+    fila de este fixture ya dice `debe`: la pagina se corrigio sola y le dio la
+    razon al arbitraje. Eso salia por `aplicar` como "correccion que no aplica",
+    que `build.py` hace GRAVE, y grave aborta el build -- asi que el bot se caia
+    justo cuando el repo acertaba. Ahora lo reporta `marcadores_cumplidos`, que no
+    es grave, y `aplicar` se calla. Que la pagina cambie a una TERCERA cosa sigue
+    siendo grave: ver `test_si_la_pagina_cambio_a_OTRA_cosa_sigue_siendo_grave`."""
+    from fad.correcciones import Marcador
+    monkeypatch.setattr(correcciones, "MARCADORES", (
+        Marcador(pagina="Una Pagina", jornada="Fecha 1", local="All Boys",
+                 visita="Belgrano", dice=(0, 1), debe=(1, 0), porque="x" * 90),))
+    ps = [partido("All Boys", "Belgrano", 1, 0, jornada="Fecha 1")]   # ya esta bien
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (0, []), "no se aplica, y no se denuncia como grave"
+    dichos = correcciones.marcadores_cumplidos("Una Pagina", ps)
+    assert len(dichos) == 1 and "YA NO HACE FALTA" in dichos[0]
+
+
+def test_un_marcador_arbitrado_se_aplica(monkeypatch):
+    from fad.correcciones import Marcador
+    monkeypatch.setattr(correcciones, "MARCADORES", (
+        Marcador(pagina="Una Pagina", jornada="Fecha 1", local="All Boys",
+                 visita="Belgrano", dice=(0, 1), debe=(1, 0), porque="x" * 90),))
+    ps = [partido("All Boys", "Belgrano", 0, 1, jornada="Fecha 1")]
+    n, _ = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 1 and (ps[0].goles_local, ps[0].goles_visita) == (1, 0)
+
+
+# --------------------------------------------------------------------------
+# la cancha: la tercera forma que tiene la fuente de contradecirse
+# --------------------------------------------------------------------------
+from fad.correcciones import Cancha
+
+# --------------------------------------------------------------------------
+# el arbitraje que la fuente alcanzo
+# --------------------------------------------------------------------------
+from fad.correcciones import Marcador  # noqa: E402
+
+UN_ARBITRAJE = Marcador(pagina="Una Pagina", jornada="Fecha 12",
+                        local="All Boys", visita="Belgrano",
+                        dice=(2, 2), debe=(2, 0), porque="de prueba")
+
+
+def _con_marcador(monkeypatch, *ms):
+    monkeypatch.setattr(correcciones, "MARCADORES", ms)
+
+
+def test_un_arbitraje_que_la_fuente_alcanzo_no_es_grave(monkeypatch):
+    """EL DIA QUE ACERTAR TUMBO EL BOT.
+
+    Un `Marcador` se identifica por el marcador que la pagina publicaba, asi que
+    cuando la pagina SE CORRIGE deja de enganchar. Eso salia como "correccion que
+    no aplica", que es grave, y grave aborta el build: el 26/09/2026 el bot se cayo
+    porque Wikipedia le dio la razon al arbitraje del Claypole siete dias despues
+    de escrito.
+
+    No hay nada que mirar antes de escribir: la pagina publica lo que el arbitraje
+    pedia, asi que el dato sale bien con la entrada o sin ella."""
+    _con_marcador(monkeypatch, UN_ARBITRAJE)
+    ps = [partido("All Boys", "Belgrano", 2, 0)]      # la pagina ya dice el `debe`
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (0, []), "no se aplica nada y NO se denuncia"
+    assert (ps[0].goles_local, ps[0].goles_visita) == (2, 0)
+
+
+def test_el_cumplido_se_reporta_para_que_alguien_lo_saque(monkeypatch):
+    """Callarse no alcanza: una entrada que ya no hace nada tiene que pedir que la
+    saquen, o se acumula en silencio -- que es el problema que `revisados_huerfanos`
+    ya resolvia para la otra familia."""
+    _con_marcador(monkeypatch, UN_ARBITRAJE)
+    ps = [partido("All Boys", "Belgrano", 2, 0)]
+    dichos = correcciones.marcadores_cumplidos("Una Pagina", ps)
+    assert len(dichos) == 1
+    assert "YA NO HACE FALTA" in dichos[0] and "2-0" in dichos[0]
+    assert correcciones.marcadores_cumplidos("Otra Pagina", ps) == []
+
+
+def test_si_la_pagina_cambio_a_OTRA_cosa_sigue_siendo_grave(monkeypatch):
+    """LA MITAD QUE NO SE AFLOJA, y es la razon de que el eje sea DEMOSTRABLE y no
+    "temporada abierta".
+
+    Que la pagina diga hoy exactamente nuestro `debe` se prueba mirando la fila.
+    Que haya cambiado a una TERCERA cosa no prueba nada: es un marcador que nadie
+    arbitro, sobre un partido que el repo tiene documentado de otra manera. Eso hay
+    que mirarlo antes de publicarlo."""
+    _con_marcador(monkeypatch, UN_ARBITRAJE)
+    ps = [partido("All Boys", "Belgrano", 1, 1)]      # ni `dice` ni `debe`
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0
+    assert len(avisos) == 1 and "engancha con 0 partidos" in avisos[0]
+    assert correcciones.marcadores_cumplidos("Una Pagina", ps) == []
+
+
+def test_los_cumplidos_se_preguntan_ANTES_de_aplicar(monkeypatch):
+    """La dependencia de orden, escrita para que no se pierda.
+
+    `aplicar` ESCRIBE `debe` sobre la fila. Despues de correr, un arbitraje que se
+    aplico perfecto deja la fila diciendo exactamente lo mismo que uno que la pagina
+    alcanzo sola, y los dos serian indistinguibles. Preguntar despues convertiria
+    cada correccion aplicada en un falso "ya no hace falta"."""
+    _con_marcador(monkeypatch, UN_ARBITRAJE)
+    ps = [partido("All Boys", "Belgrano", 2, 2)]      # la pagina dice `dice`
+    assert correcciones.marcadores_cumplidos("Una Pagina", ps) == [], "antes: no"
+    n, _ = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 1 and (ps[0].goles_local, ps[0].goles_visita) == (2, 0)
+    assert correcciones.marcadores_cumplidos("Una Pagina", ps), \
+        "despues de aplicar la fila dice `debe`, y por eso hay que preguntar antes"
+
+
+def test_el_arbitraje_de_solo_penales_tambien_se_da_por_cumplido(monkeypatch):
+    """El caso que rompia la guarda de mas.
+
+    Cuando el arbitraje corrige SOLO la tanda, `debe` es igual a `dice` en goles.
+    La primera version preguntaba "¿la fila todavia dice `dice`?" antes que nada, y
+    para estos contestaba que si --porque los goles coinciden-- aunque la pagina ya
+    hubiera arreglado los penales. Lo encontre pensando el caso, no corriendolo:
+    hoy no hay ninguno de estos sobre una pagina viva."""
+    m = Marcador(pagina="Una Pagina", jornada="Fecha 12", local="All Boys",
+                 visita="Belgrano", dice=(1, 1), debe=(1, 1),
+                 penales_dice=(3, 4), penales_debe=(4, 3), porque="de prueba")
+    _con_marcador(monkeypatch, m)
+    p = partido("All Boys", "Belgrano", 1, 1)
+    p.penales_local, p.penales_visita = 4, 3          # la pagina ya la arreglo
+    assert correcciones.marcadores_cumplidos("Una Pagina", [p]), \
+        "los goles coinciden en las dos puntas, pero la tanda ya es la nuestra"
+    assert correcciones.aplicar([p], "Una Pagina") == (0, [])
+
+
+UNA_CANCHA = Cancha(pagina="Una Pagina", jornada="Fecha 36",
+                    local="Gimnasia y Esgrima (J)", visita="San Martín (T)",
+                    dice="Víctor Antonio Legrotaglie", debe="23 de Agosto",
+                    porque="de prueba")
+
+
+def _con_cancha(estadio, jornada="Fecha 36", local="Gimnasia y Esgrima (J)"):
+    p = partido(local, "San Martín (T)", jornada=jornada)
+    p.estadio = estadio
+    return p
+
+
+def test_corrige_la_cancha(monkeypatch):
+    monkeypatch.setattr(correcciones, "CANCHAS", (UNA_CANCHA,))
+    ps = [_con_cancha("Víctor Antonio Legrotaglie")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (1, [])
+    assert ps[0].estadio == "23 de Agosto"
+
+
+def test_la_cancha_vieja_es_parte_de_la_identificacion(monkeypatch):
+    """Si la pagina ya dice otra cosa, la correccion no se aplica a ciegas: o la
+    arreglaron, o esta parada sobre un partido que no es."""
+    monkeypatch.setattr(correcciones, "CANCHAS", (UNA_CANCHA,))
+    ps = [_con_cancha("23 de Agosto")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0 and len(avisos) == 1 and "engancha con 0" in avisos[0]
+
+
+def test_una_cancha_corregida_que_ya_no_engancha_avisa(monkeypatch):
+    """Cuando alguien arregle la pagina, esta entrada queda sin efecto y el build
+    lo dice. Una correccion vieja que nadie saco es una mentira dormida."""
+    monkeypatch.setattr(correcciones, "CANCHAS", (UNA_CANCHA,))
+    n, avisos = correcciones.aplicar([_con_cancha("Otra", jornada="Fecha 1")], "Una Pagina")
+    assert n == 0 and avisos and "sacala de fad/correcciones.py" in avisos[0]
+
+
+def test_no_toca_las_canchas_de_otra_pagina(monkeypatch):
+    monkeypatch.setattr(correcciones, "CANCHAS", (UNA_CANCHA,))
+    ps = [_con_cancha("Víctor Antonio Legrotaglie")]
+    assert correcciones.aplicar(ps, "Otra Pagina") == (0, [])
+    assert ps[0].estadio == "Víctor Antonio Legrotaglie"
+
+
+def test_las_canchas_corregidas_estan_justificadas():
+    """La condicion del modulo: la fuente se contradice sola y se dice donde. Las
+    dos que hay salen de la tabla de participantes de la propia pagina."""
+    for c in correcciones.CANCHAS:
+        assert len(c.porque) > 80, f"{c.jornada} {c.local}: la evidencia es muy flaca"
+        assert "participantes" in c.porque, "hay que nombrar al testigo"
+        assert c.dice != c.debe
+
+
+# --------------------------------------------------------------------------
+# Reemplazo: la fila que no era una version equivocada del partido sino OTRO
+# --------------------------------------------------------------------------
+def _fila(llave, jornada, local, visita, gl, gv):
+    p = Partido(fecha="", local=local, visita=visita, goles_local=gl, goles_visita=gv,
+                fase="zonas", jornada=jornada)
+    p.llave = llave
+    return p
+
+
+def test_un_reemplazo_cambia_el_partido_entero():
+    """No es un campo mal: la fila describia otro partido. Cambian los dos clubes
+    y el marcador de una."""
+    p = _fila("Torneo Apertura", "Fecha 5", "Douglas Haig", "Cipolletti", 5, 3)
+    _, avisos = correcciones.aplicar([p], "Torneo Argentino A 2005-06")
+    assert (p.local, p.visita, p.goles_local, p.goles_visita) == ("Cipolletti", "Douglas Haig", 1, 2)
+    # Las demas correcciones de la pagina avisan que no enganchan, y esta bien:
+    # la lista tiene un solo partido. Lo que importa es que ESTA no avise.
+    assert not [a for a in avisos if "Douglas Haig vs Cipolletti" in a]
+
+
+def test_la_llave_es_lo_que_hace_posible_el_reemplazo():
+    """Sin ella no se puede: la pagina del Argentino A 2005-06 copio dos jornadas
+    del Clausura dentro del Apertura, asi que las filas son IDENTICAS en
+    (jornada, local, visita, marcador) de los dos lados.
+
+    Este test pone las dos y exige que se toque UNA. Con la clave vieja la
+    correccion enganchaba con dos partidos y no se aplicaba -- que era la
+    conducta correcta, y por eso hubo que agregar el campo en vez de forzarla."""
+    ap = _fila("Torneo Apertura", "Fecha 5", "Douglas Haig", "Cipolletti", 5, 3)
+    cl = _fila("Torneo Clausura", "Fecha 5", "Douglas Haig", "Cipolletti", 5, 3)
+    _, avisos = correcciones.aplicar([ap, cl], "Torneo Argentino A 2005-06")
+    assert not [a for a in avisos if "Douglas Haig vs Cipolletti" in a]
+    assert (ap.local, ap.goles_local, ap.goles_visita) == ("Cipolletti", 1, 2), "el del Apertura"
+    assert (cl.local, cl.goles_local, cl.goles_visita) == ("Douglas Haig", 5, 3), "el del Clausura no se toca"
+
+
+def test_un_reemplazo_que_ya_no_engancha_avisa():
+    """Si alguien arregla la pagina de Wikipedia, la correccion sobra y hay que
+    sacarla. Callarse dejaria una correccion muerta pudriendose en el modulo."""
+    p = _fila("Torneo Apertura", "Fecha 5", "Cipolletti", "Douglas Haig", 1, 2)
+    n, avisos = correcciones.aplicar([p], "Torneo Argentino A 2005-06")
+    assert any("Douglas Haig" in a and "no se aplica" in a for a in avisos)
+
+
+def test_los_reemplazos_nombran_su_testigo():
+    """Cambiar un partido entero es lo mas fuerte que hace este modulo, asi que
+    cada uno tiene que decir con que evidencia. La de estos es la tabla de
+    posiciones de la propia pagina, que el copy-paste no toco."""
+    for r in correcciones.REEMPLAZOS:
+        assert len(r.porque) > 120, f"{r.jornada} {r.dice}: la evidencia es muy flaca"
+        assert "tabla" in r.porque.lower(), f"{r.jornada} {r.dice}: no nombra el testigo"
+        assert r.llave, f"{r.jornada} {r.dice}: sin llave no identifica"
+
+
+def test_ningun_reemplazo_deja_el_partido_igual():
+    for r in correcciones.REEMPLAZOS:
+        assert r.dice != r.debe, f"{r.jornada}: reemplazo que no reemplaza nada"
+
+
+# --------------------------------------------------------------------------
+# homonimos: el club mal escrito en TODA la pagina
+# --------------------------------------------------------------------------
+UN_HOMONIMO = correcciones.Homonimo(
+    pagina="Una Pagina", dice="Juventud Unida", debe="Juventud Unida Universitario",
+    porque="de prueba")
+
+
+def test_un_homonimo_renombra_al_club_de_los_dos_lados(monkeypatch):
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    ps = [partido("Juventud Unida", "Belgrano"), partido("All Boys", "Juventud Unida")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert avisos == []
+    assert [(p.local, p.visita) for p in ps] == [
+        ("Juventud Unida Universitario", "Belgrano"),
+        ("All Boys", "Juventud Unida Universitario")]
+
+
+def test_un_homonimo_no_toca_al_club_que_se_llama_parecido(monkeypatch):
+    """Es todo el punto: `Juventud Unida` y `Juventud Unida Universitario` son
+    dos clubes, y el segundo ya esta bien escrito."""
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    ps = [partido("Juventud Unida Universitario", "Belgrano")]
+    correcciones.aplicar(ps, "Una Pagina")
+    assert ps[0].local == "Juventud Unida Universitario"
+
+
+def test_un_homonimo_no_sale_de_su_pagina(monkeypatch):
+    """Un alias global arreglaria una pagina y romperia las otras seis, donde
+    `Juventud Unida` es de verdad el club de Primera C."""
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    ps = [partido("Juventud Unida", "Belgrano")]
+    assert correcciones.aplicar(ps, "Otra Pagina") == (0, [])
+    assert ps[0].local == "Juventud Unida"
+
+
+def test_un_homonimo_que_ya_no_engancha_avisa(monkeypatch):
+    """Cuando alguien arregle la pagina esto queda sin efecto, y hay que sacarlo.
+    Este aviso es el que descubrio que cinco homonimos que se habian escrito ya
+    estaban resueltos como `Correccion`.
+
+    Y EL MENSAJE NOMBRA LAS DOS CAUSAS. La otra es que `dice` se haya escrito con
+    el nombre CRUDO de la pagina en vez del canonico: `homonimo()` corre despues
+    de `equipos.canonizar`, asi que un homonimo escrito con el crudo no falla, no
+    engancha nunca. Un aviso que solo dice "la pagina ya no lo escribe" manda a
+    mirar Wikipedia cuando el error esta en la declaracion."""
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    avisos = correcciones.homonimos_huerfanos("Una Pagina", {"All Boys", "Belgrano"})
+    assert avisos
+    assert "fad/correcciones.py" in avisos[0]
+    assert "CRUDO" in avisos[0], "el aviso tiene que nombrar la otra causa"
+
+
+def test_un_homonimo_que_solo_arregla_la_tabla_no_se_denuncia_solo(monkeypatch):
+    """El control mira los dos lados juntos. Adentro de `aplicar`, que solo ve los
+    partidos, un homonimo que corrige unicamente la tabla de posiciones se
+    declaraba vencido a si mismo -- y el aviso decia lo contrario de la verdad."""
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    ps = [partido("Juventud Unida Universitario", "Belgrano")]   # la grilla ya esta bien
+    assert correcciones.aplicar(ps, "Una Pagina") == (0, [])
+    # el nombre corto lo escribe la tabla, y por eso el homonimo sigue haciendo falta
+    escritos = {"Juventud Unida Universitario", "Belgrano", "Juventud Unida"}
+    assert correcciones.homonimos_huerfanos("Una Pagina", escritos) == []
+
+
+def test_un_homonimo_vale_para_la_tabla_igual_que_para_los_partidos(monkeypatch):
+    """Las dos puertas tienen que dar el mismo nombre. Si la tabla resolviera por
+    su cuenta, el cruce no encontraria al club en las dos partes y se saltearia
+    la fila -- que es exactamente lo que el homonimo vino a arreglar."""
+    monkeypatch.setattr(correcciones, "HOMONIMOS", (UN_HOMONIMO,))
+    assert correcciones.homonimo("Una Pagina", "Juventud Unida") == "Juventud Unida Universitario"
+    assert correcciones.homonimo("Otra Pagina", "Juventud Unida") == "Juventud Unida"
+
+
+def test_los_homonimos_corren_despues_de_las_correcciones():
+    """El orden no es indistinto: una `Correccion` se identifica por el nombre
+    EQUIVOCADO. Si el homonimo renombrara antes, la correccion se apagaria sola
+    y nadie se enteraria."""
+    dice = correcciones.HOMONIMOS[0].dice
+    assert not any(dice in (c.dice[0], c.dice[1])
+                   for c in correcciones.CORRECCIONES
+                   if c.pagina == correcciones.HOMONIMOS[0].pagina), (
+        "hay una Correccion escrita sobre el nombre que el homonimo pisa")
+
+
+def test_los_homonimos_nombran_su_testigo():
+    for h in correcciones.HOMONIMOS:
+        assert len(h.porque) > 40, f"{h.dice}: falta la evidencia"
+        assert h.dice != h.debe
+
+
+# --------------------------------------------------------------------------
+# el partido que la pagina tiene y no se puede leer
+# --------------------------------------------------------------------------
+UN_FALTANTE = correcciones.Faltante(
+    pagina="Una Pagina", jornada="Fecha 1", local="Defensores de Cambaceres",
+    visita="Sportivo Barracas", goles=(0, 0), fecha="2016-02-05", hora="17:00",
+    estadio="12 de Octubre", porque="de prueba", testigos=("uno", "otro"))
+
+
+def _hermano():
+    p = partido("San Miguel", "Deportivo Laferrere", 1, 3, jornada="Fecha 1")
+    p.torneo, p.zona = "Primera C", "Zona Unica"
+    return p
+
+
+def test_un_faltante_agrega_el_partido(monkeypatch):
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    ps = [_hermano()]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert (n, avisos) == (1, [])
+    nuevo = ps[-1]
+    assert (nuevo.local, nuevo.visita) == ("Defensores de Cambaceres", "Sportivo Barracas")
+    assert (nuevo.goles_local, nuevo.goles_visita) == (0, 0)
+    assert nuevo.fecha == "2016-02-05" and nuevo.estadio == "12 de Octubre"
+
+
+def test_el_faltante_hereda_el_contexto_de_su_jornada(monkeypatch):
+    """Torneo, fase y zona son de la RONDA, no del partido. Escribirlos a mano en
+    la correccion haria que esta fila sea la unica del torneo que dice otra cosa,
+    y eso no falla: sale al CSV con un `group` distinto y el que lo consuma cuenta
+    dos zonas donde hay una."""
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    ps = [_hermano()]
+    correcciones.aplicar(ps, "Una Pagina")
+    assert (ps[-1].torneo, ps[-1].fase, ps[-1].zona) == ("Primera C", "zonas", "Zona Unica")
+
+
+def test_un_faltante_con_tanda_la_escribe(monkeypatch):
+    """Una eliminatoria que termina empatada NO tiene ganador en el marcador. Sin
+    la tanda, el 0-0 del Godoy Cruz-Armenio entra como un empate cualquiera y el
+    dataset se queda sin decir quien paso, que es justo el dato de la ronda."""
+    monkeypatch.setattr(correcciones, "FALTANTES",
+                        (replace(UN_FALTANTE, penales=(6, 5)),))
+    ps = [_hermano()]
+    correcciones.aplicar(ps, "Una Pagina")
+    assert (ps[-1].penales_local, ps[-1].penales_visita) == (6, 5)
+
+
+def test_un_faltante_sin_tanda_no_hereda_la_del_hermano(monkeypatch):
+    """El contexto se hereda del hermano de la jornada, y la tanda NO es contexto:
+    es del partido. Si se colara, un faltante que se definio en los noventa
+    minutos saldria con los penales de otro partido."""
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    h = _hermano()
+    h.penales_local, h.penales_visita = 4, 2
+    ps = [h]
+    correcciones.aplicar(ps, "Una Pagina")
+    assert UN_FALTANTE.penales is None
+    assert (ps[-1].penales_local, ps[-1].penales_visita) == (None, None)
+
+
+def test_un_faltante_no_duplica_si_arreglaron_la_pagina(monkeypatch):
+    """El dia que alguien complete la celda en Wikipedia, el parser va a leer la
+    fila y esta entrada sobra. Sin la guarda, el partido entraria dos veces."""
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    ya = partido("Defensores de Cambaceres", "Sportivo Barracas", 0, 0, jornada="Fecha 1")
+    ps = [_hermano(), ya]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0 and len(ps) == 2
+    assert avisos and "sacalo de fad/correcciones.py" in avisos[0]
+
+
+def test_un_faltante_sin_hermano_en_su_jornada_no_se_agrega(monkeypatch):
+    """Sin hermano no hay de donde heredar la fase ni la zona, y una fila colgada
+    de la nada es peor que una fila que falta: la primera miente en silencio."""
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    ps = [partido("San Miguel", "Deportivo Laferrere", 1, 3, jornada="Fecha 9")]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0 and len(ps) == 1 and avisos
+
+
+def test_un_faltante_no_sale_de_su_pagina(monkeypatch):
+    monkeypatch.setattr(correcciones, "FALTANTES", (UN_FALTANTE,))
+    ps = [_hermano()]
+    assert correcciones.aplicar(ps, "Otra Pagina") == (0, [])
+    assert len(ps) == 1
+
+
+def test_los_faltantes_nombran_sus_dos_testigos():
+    """Es el unico tipo que AGREGA una fila, asi que la vara es mas alta: el
+    marcador tiene que salir de la pagina misma y con dos testigos que no
+    dependan uno del otro. Si hay que buscarlo afuera, no entra.
+
+    El test cuenta los testigos en vez de buscarles palabras. Cuando hubo un solo
+    Faltante alcanzaba con exigir "tabla" y "resaltado" en el `porque`, pero eso
+    era el caso, no la regla: el segundo Faltante se rompe de otra forma y se
+    apoya en el cuadro y en las rondas siguientes. La regla que sobrevive a los
+    dos es que sean dos y que digan de donde salen."""
+    for f in correcciones.FALTANTES:
+        assert len(f.porque) > 200, f"{f.local}: la evidencia es muy flaca"
+        assert len(f.testigos) >= 2, f"{f.local}: tiene menos de dos testigos"
+        for t in f.testigos:
+            assert len(t) > 80, f"{f.local}: el testigo {t!r} no dice nada"
+        assert len(set(f.testigos)) == len(f.testigos), f"{f.local}: repetido"
+
+
+# --------------------------------------------------------------------------
+# el partido con dos resultados, uno por club
+# --------------------------------------------------------------------------
+UN_DIVIDIDO = correcciones.Dividido(
+    pagina="Una Pagina", local="Almagro", visita="Boca Juniors", dice=(0, 2),
+    porque="de prueba: el tribunal se lo dio por perdido a los dos, con marcadores "
+           "distintos para cada uno")
+
+
+def test_un_dividido_sale_del_dataset(monkeypatch):
+    """Una fila tiene un `home_score` y un `away_score`: cualquier par de numeros
+    afirma UN resultado, y aca hay dos. Publicar el de un club como si fuera el de
+    los dos es peor que no publicar la fila."""
+    monkeypatch.setattr(correcciones, "DIVIDIDOS", (UN_DIVIDIDO,))
+    ps = [partido("Almagro", "Boca Juniors", 0, 2), partido("All Boys", "Belgrano", 1, 1)]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert [(p.local, p.visita) for p in ps] == [("All Boys", "Belgrano")]
+    assert avisos == []
+
+
+def test_el_marcador_identifica_a_cual_de_los_cruces_sacar(monkeypatch):
+    """Los mismos dos clubes juegan varias veces en la misma pagina. Sin el
+    marcador, sacar 'Almagro vs Boca' saca tambien la ida."""
+    monkeypatch.setattr(correcciones, "DIVIDIDOS", (UN_DIVIDIDO,))
+    ps = [partido("Almagro", "Boca Juniors", 1, 1)]
+    correcciones.aplicar(ps, "Una Pagina")
+    assert len(ps) == 1, "saco un partido que no era"
+
+
+def test_un_dividido_sin_marcador_no_saca_nada(monkeypatch):
+    """`dice=None` quiere decir que esa fila NUNCA llega hasta aca, porque su
+    celda no se puede leer como marcador (`PP - PP`). No es 'sacar cualquiera':
+    leerlo asi borro un Independiente (N) - Deportivo Roca de otra fase."""
+    monkeypatch.setattr(correcciones, "DIVIDIDOS", (
+        correcciones.Dividido(pagina="Una Pagina", local="Almagro", visita="Boca Juniors",
+                              dice=None, porque="de prueba"),))
+    ps = [partido("Almagro", "Boca Juniors", 0, 2)]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert len(ps) == 1 and n == 0 and avisos == []
+
+
+def test_un_dividido_que_ya_no_esta_avisa(monkeypatch):
+    monkeypatch.setattr(correcciones, "DIVIDIDOS", (UN_DIVIDIDO,))
+    n, avisos = correcciones.aplicar([partido("All Boys", "Belgrano")], "Una Pagina")
+    assert avisos and "sacalo de fad/correcciones.py" in avisos[0]
+
+
+def test_los_divididos_se_nombran_uno_por_uno():
+    """Sacarlos en silencio seria perder el partido. El build los nombra."""
+    for d in correcciones.DIVIDIDOS:
+        assert d.local in "".join(correcciones.divididos_de(d.pagina))
+        assert len(d.porque) > 80, f"{d.local}: falta la evidencia"
+
+
+def test_los_divididos_no_salen_de_su_pagina(monkeypatch):
+    monkeypatch.setattr(correcciones, "DIVIDIDOS", (UN_DIVIDIDO,))
+    ps = [partido("Almagro", "Boca Juniors", 0, 2)]
+    correcciones.aplicar(ps, "Otra Pagina")
+    assert len(ps) == 1
+
+
+def test_el_par_dividido_se_lleva_su_alcance():
+    """El alcance viaja CON EL PAR hasta el chequeo que lo usa. Si se pierde en
+    el camino, el dividido del Torneo Federal A 2018-19 -- que es de la Revalida
+    -- se cuenta tambien en la Primera fase, porque sus dos clubes juegan las
+    dos y buscarlos por nombre los encuentra dos veces.
+
+    Va sobre `pares_divididos` y no sobre el chequeo: pasandole los pares a mano,
+    el chequeo respeta el alcance igual y este error no se ve. Es el mismo agujero
+    de siempre -- probar la funcion y no a quien la llama --, y lo destapo un
+    mutante que sobrevivio.
+    """
+    pares = correcciones.pares_divididos("Torneo Federal A 2018-19")
+    assert pares and all(llave for _, _, llave in pares), "el alcance no puede venir vacio"
+
+    # y los dos escandalos de arreglo del Argentino A 2006-07 estan alcanzados al
+    # Clausura, que es la fase donde se jugaron: en el Apertura esos clubes tienen
+    # sus catorce partidos completos y sumarles uno los dejaria con quince
+    clausura = correcciones.pares_divididos("Torneo Argentino A 2006-07")
+    assert len(clausura) == 2 and all(l == "Torneo Clausura" for _, _, l in clausura)
+
+
+def test_el_renombre_se_puede_preguntar_antes_de_aplicarlo():
+    """`aplicar` corre mas abajo en el pipeline que la deduplicacion, asi que
+    cuando se deduplica la pagina todavia dice "Alumni" a secas -- que en el
+    padron es otro club -- mientras que la fila de RSSSF ya viene con "Alumni
+    (VM)". Sin poder preguntarlo antes, el cruce no las reconoce y los dos
+    partidos de la promocion del Argentino A 2005-06 entran dos veces.
+
+    Y entraron: los agarro `sin_duplicados` como GRAVE, que es el sistema
+    funcionando -- pero frenar el build es peor que no duplicar.
+    """
+    assert correcciones.renombrado(
+        "Torneo Argentino A 2005-06", "Promoción",
+        "Alumni", "General Paz Juniors", 5, 0) == ("Alumni (VM)", "General Paz Juniors")
+
+
+def test_el_renombre_no_toca_lo_que_no_declara():
+    """Con otro marcador ya no es ese partido, y devolver los nombres como vinieron
+    es lo unico honesto."""
+    assert correcciones.renombrado(
+        "Torneo Argentino A 2005-06", "Promoción",
+        "Alumni", "General Paz Juniors", 9, 9) == ("Alumni", "General Paz Juniors")
+    assert correcciones.renombrado(
+        "Otra Pagina", "Promoción",
+        "Alumni", "General Paz Juniors", 5, 0) == ("Alumni", "General Paz Juniors")
+
+
+def test_el_marcador_arbitrado_se_puede_preguntar_antes_de_aplicarlo():
+    """El gemelo del anterior para la otra familia de correcciones.
+
+    La deduplicacion corre ANTES que `aplicar`, asi que sin poder preguntarlo el
+    build enfrentaba "la pagina dice X y la otra fuente dice Y" sobre cuatro
+    partidos de la Revalida del Argentino A 2011-12 cuyo marcador ya estaba
+    arbitrado y escrito. Una notificacion que se vuelve falsa dos pasos mas abajo
+    es peor que no tenerla.
+    """
+    assert correcciones.arbitrado(
+        "Torneo Argentino A 2011-12", "Reválida - Tercera ronda",
+        "Central Norte (S)", "Libertad (S)", 2, 1) == (2, 0)
+
+
+def test_el_arbitraje_se_pregunta_contra_la_fila_YA_espejada():
+    """El orden importa y no es simetrico: `aplicar` corre las `Correccion`
+    primero y los `Marcador` despues, asi que un `Marcador` se declara contra la
+    fila ya dada vuelta.
+
+    Preguntado con los nombres crudos de la pagina -- que en esta llave son los
+    del otro lado -- no tiene que enganchar nada. Devolver `debe` ahi seria
+    aplicar el arbitraje dos veces o del lado equivocado."""
+    crudo = correcciones.arbitrado(
+        "Torneo Argentino A 2011-12", "Reválida - Tercera ronda",
+        "Libertad (S)", "Central Norte (S)", 1, 2)
+    assert crudo == (1, 2), "con los nombres de antes del espejo no engancha"
+
+
+def test_el_arbitraje_no_toca_lo_que_no_declara():
+    """Con otro marcador ya no es esa fila, y con otra pagina tampoco. Devolver
+    los goles como vinieron es lo unico honesto: no hay nada declarado."""
+    assert correcciones.arbitrado(
+        "Torneo Argentino A 2011-12", "Reválida - Tercera ronda",
+        "Central Norte (S)", "Libertad (S)", 9, 9) == (9, 9)
+    assert correcciones.arbitrado(
+        "Otra Pagina", "Reválida - Tercera ronda",
+        "Central Norte (S)", "Libertad (S)", 2, 1) == (2, 1)
+
+
+# --------------------------------------------------------------------------
+# El Federal A 2014: un desambiguador equivocado y un nombre pelado
+# --------------------------------------------------------------------------
+def _zona_3_del_federal_a_2014():
+    """Tres filas de verdad de esa pagina, con los nombres como los deja
+    `equipos.canonizar`: los dos que el padron no conoce llegan crudos."""
+    return [partido("Mitre (S)", "Unión Aconquija", jornada="Fecha 1"),
+            partido("Altos Hornos Zapla", "Mitre (S)", 0, 1, jornada="Fecha 4"),
+            partido("San Jorge", "Altos Hornos Zapla", 1, 1, jornada="Fecha 5")]
+
+
+def test_el_mitre_S_del_federal_a_2014_es_el_de_santiago_y_solo_ahi():
+    """`Mitre (S)` no es un alias del padron porque en el resto del corpus es Mitre
+    de SALTA. El homonimo lo arregla en la unica pagina que se lo escribe al de
+    Santiago del Estero, y afuera de ella el nombre queda como vino -- que es lo
+    que hace que un `Mitre (S)` de la Copa Argentina frene el build en vez de
+    caer calladito en el club equivocado."""
+    assert correcciones.homonimo("Torneo Federal A 2014", "Mitre (S)") == "Mitre (SdE)"
+    assert correcciones.homonimo("Copa Argentina 2014-15", "Mitre (S)") == "Mitre (S)"
+    ps = _zona_3_del_federal_a_2014()
+    _, avisos = correcciones.aplicar(ps, "Torneo Federal A 2014")
+    # Solo los avisos de ESTOS nombres: las otras correcciones de la pagina avisan que
+    # no enganchan con nada, porque el accesorio trae tres filas y no la pagina entera.
+    assert not [a for a in avisos if "Mitre" in a or "San Jorge" in a]
+    assert [(p.local, p.visita) for p in ps[:2]] == [
+        ("Mitre (SdE)", "Unión Aconquija"), ("Altos Hornos Zapla", "Mitre (SdE)")]
+
+
+def test_el_san_jorge_pelado_del_federal_a_2014_se_corrige_en_SU_fila():
+    """Una sola fila, asi que va `Correccion` y no homonimo ni alias: identifica el
+    partido entero. El mismo nombre con otro marcador no es ese partido, y ahi la
+    correccion se niega y lo dice."""
+    ps = _zona_3_del_federal_a_2014()
+    _, avisos = correcciones.aplicar(ps, "Torneo Federal A 2014")
+    assert not [a for a in avisos if "San Jorge" in a]
+    assert (ps[2].local, ps[2].visita) == ("San Jorge (T)", "Altos Hornos Zapla")
+
+    otra = [partido("San Jorge", "Altos Hornos Zapla", 2, 1, jornada="Fecha 5")]
+    _, avisos = correcciones.aplicar(otra, "Torneo Federal A 2014")
+    assert otra[0].local == "San Jorge", "con otro marcador no es ese partido"
+    assert any("San Jorge" in a for a in avisos)
+
+
+def test_las_copias_declaradas_estan_justificadas():
+    """Lo mismo que se le pide a cualquier correccion: evidencia escrita y un campo
+    que la regla sabe unificar. Y una hora no es una grafia: elegir entre dos pide
+    un testigo de afuera, con su direccion."""
+    from fad import equipos
+    for c in correcciones.COPIAS:
+        assert len(c.porque) > 80, f"{c.fecha} {c.local}: la evidencia es muy flaca"
+        assert c.campo in ("time", "venue"), c.campo
+        for n in (c.local, c.visita):
+            assert equipos.buscar(n) is not None, f"{n!r} no esta en el padron"
+        if c.campo == "time":
+            assert "http" in c.porque, f"{c.fecha} {c.local}: una hora pide testigo citado"
+
+
+# --------------------------------------------------------------------------
+# Neutral: la frase que habla de varias rondas, leida a mano
+# --------------------------------------------------------------------------
+from fad.correcciones import Neutral  # noqa: E402
+
+UN_NEUTRAL = Neutral(pagina="Una Pagina", fecha="2009-10-29",
+                     dice=("All Boys", "Belgrano", 2, 1), porque="de prueba")
+
+
+def _con_neutral(monkeypatch, *ns):
+    monkeypatch.setattr(correcciones, "NEUTRALES", ns)
+
+
+def test_un_partido_declarado_neutral_se_marca(monkeypatch):
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    ps = [partido("All Boys", "Belgrano", 2, 1)]
+    assert correcciones.aplicar(ps, "Una Pagina") == (1, [])
+    assert ps[0].neutral is True
+
+
+def test_el_neutral_se_identifica_por_fecha_clubes_y_marcador(monkeypatch):
+    """Con los cuatro campos no cae sobre otro partido: la ida y la vuelta de una
+    llave tienen los mismos clubes, y el mismo par puede cruzarse otro dia. Y el
+    mismo dia hay otros partidos de la ronda con el mismo marcador, de un club de los
+    dos con otro rival."""
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    otros = [partido("All Boys", "Belgrano", 1, 1),                     # otro marcador
+             partido("Belgrano", "All Boys", 2, 1),                     # al reves
+             replace(partido("All Boys", "Belgrano", 2, 1), fecha="2009-11-05"),
+             partido("Atlanta", "Belgrano", 2, 1),                      # otro local
+             partido("All Boys", "Atlanta", 2, 1)]                      # otro visitante
+    for p in otros:
+        n, avisos = correcciones.aplicar([p], "Una Pagina")
+        assert n == 0 and p.neutral is None
+        assert len(avisos) == 1 and "engancha con 0" in avisos[0]
+
+
+def test_el_neutral_no_pide_la_jornada(monkeypatch):
+    """Varias de las filas declaradas no tienen `matchday`: el desempate de la
+    Primera C 2023, el triangular de 2008."""
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    ps = [partido("All Boys", "Belgrano", 2, 1, jornada="")]
+    assert correcciones.aplicar(ps, "Una Pagina") == (1, [])
+    assert ps[0].neutral is True
+
+
+def test_un_neutral_que_engancha_con_dos_no_marca_ninguno(monkeypatch):
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    ps = [partido("All Boys", "Belgrano", 2, 1), partido("All Boys", "Belgrano", 2, 1)]
+    n, avisos = correcciones.aplicar(ps, "Una Pagina")
+    assert n == 0 and [p.neutral for p in ps] == [None, None]
+    assert len(avisos) == 1 and "engancha con 2" in avisos[0]
+
+
+def test_un_neutral_no_sale_de_su_pagina(monkeypatch):
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    ps = [partido("All Boys", "Belgrano", 2, 1)]
+    assert correcciones.aplicar(ps, "Otra Pagina") == (0, [])
+    assert ps[0].neutral is None
+
+
+def test_el_neutral_que_la_pagina_ya_marca_sobra_sin_ser_grave(monkeypatch):
+    """Si la pagina pasa a decirlo donde el parser lo lee, la entrada no hace nada:
+    no se cuenta ni se denuncia como grave, y se pide sacarla."""
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    p = partido("All Boys", "Belgrano", 2, 1)
+    p.neutral = True
+    dichos = correcciones.neutrales_cumplidos("Una Pagina", [p])
+    assert len(dichos) == 1 and "YA NO HACE FALTA" in dichos[0]
+    assert correcciones.aplicar([p], "Una Pagina") == (0, [])
+    assert correcciones.neutrales_cumplidos("Otra Pagina", [p]) == []
+
+
+def test_los_neutrales_cumplidos_se_preguntan_ANTES_de_aplicar(monkeypatch):
+    """Despues de `aplicar` una declaracion aplicada y una que sobraba se ven igual."""
+    _con_neutral(monkeypatch, UN_NEUTRAL)
+    ps = [partido("All Boys", "Belgrano", 2, 1)]
+    assert correcciones.neutrales_cumplidos("Una Pagina", ps) == []
+    correcciones.aplicar(ps, "Una Pagina")
+    assert correcciones.neutrales_cumplidos("Una Pagina", ps)
+
+
+def test_los_neutrales_declarados_citan_su_testigo():
+    """La frase de la pagina o la prensa, citadas y con su direccion; una pagina del
+    catalogo, nombres del padron, y ninguno declarado dos veces."""
+    from fad import equipos, torneos
+    paginas = {t.pagina for t in torneos.TODOS}
+    vistos = set()
+    for n in correcciones.NEUTRALES:
+        assert n.pagina in paginas, n.pagina
+        assert len(n.porque) > 150, f"{n.fecha} {n.dice}: la evidencia es muy flaca"
+        assert "http" in n.porque and "'" in n.porque, f"{n.fecha} {n.dice}: falta la cita"
+        for club in n.dice[:2]:
+            assert equipos.buscar(club) is not None, f"{club!r} no esta en el padron"
+        clave = (n.pagina, n.fecha) + n.dice[:2]
+        assert clave not in vistos, f"declarado dos veces: {clave}"
+        vistos.add(clave)

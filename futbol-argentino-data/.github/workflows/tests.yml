@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # La minima que soporta el proyecto y la ultima estable. Sin esto, es
+        # facil escribir algo que anda en la version de la maquina de uno y no en
+        # las demas -- una f-string con comillas dobles anidadas es legal desde
+        # 3.12 y un SyntaxError en 3.11.
+        python: ["3.11", "3.13"]
+
+    steps:
+      # node24. Las v4/v5 corren sobre node20, que GitHub ya declaro muerto y
+      # desde el 16/06/2026 fuerza a correr en node24 igual, con un warning en
+      # cada corrida; lo saca del runner en algun momento del otono de 2026.
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Instalar pytest
+        run: python -m pip install --quiet pytest
+
+      - name: Correr la suite
+        run: python -m pytest tests/ -q
+
+      # Que pasen no alcanza: un test que no falla cuando el codigo se rompe no
+      # esta probando nada. Esto rompe el codigo a proposito y exige que la suite
+      # lo note. Va solo en una version para no pagarlo dos veces.
+      - name: Mutation testing
+        if: matrix.python == '3.13'
+        run: python mutar.py

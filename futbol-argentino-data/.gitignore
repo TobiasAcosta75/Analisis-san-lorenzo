@@ -1,0 +1,10 @@
+# Lo que se baja de afuera, crudo: el wikitexto de la API de Wikipedia y, en
+# subcarpetas, los archivos de RSSSF y las paginas de worldfootball. Se regenera
+# solo y no va al repo. Lo que se publica es data/partidos-AAAA.csv, que SI va.
+/.cache/
+
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
